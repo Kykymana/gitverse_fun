@@ -7,35 +7,28 @@ from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
-# --- Настройка логирования ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-# --- Настройка CORS Middleware ---
-# Разрешаем запросы с фронтенда, работающего на localhost:8888 (через Docker Compose)
 origins = [
     "http://localhost:8888",
     "http://127.0.0.1:8888",
-    # Если вы будете деплоить фронтенд на другой домен/IP, добавьте его сюда
-    # "http://your-frontend-domain.com",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["*"],  # Разрешаем все HTTP методы
-    allow_headers=["*"],  # Разрешаем все заголовки
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
-# --- Глобальная переменная для хранения конфигурации ---
 _config: Dict = {}
 
-# --- Модели данных для FastAPI ---
 class CommitInfo(BaseModel):
     hash: str
     message: str
@@ -43,7 +36,6 @@ class CommitInfo(BaseModel):
 class DeployRequest(BaseModel):
     commit_hash: str
 
-# --- Функция загрузки конфигурации ---
 def load_config_on_startup():
     """Загрузка конфигурации из JSON файла при старте приложения."""
     global _config
@@ -63,13 +55,10 @@ def load_config_on_startup():
         logger.error(f"Неизвестная ошибка при загрузке config.json: {e}")
         _config = {"repositories": []}
 
-# Загружаем конфигурацию при старте FastAPI приложения
 @app.on_event("startup")
 async def startup_event():
     load_config_on_startup()
 
-
-# --- Адаптированная функция для получения коммитов из GitVerse ---
 def get_commits_from_gitverse(repo_url: str, branch: str = "master") -> List[CommitInfo]:
     """
     Получает последние 10 коммитов (хэш и сообщение) из GitVerse для заданного репозитория и ветки.
@@ -84,11 +73,10 @@ def get_commits_from_gitverse(repo_url: str, branch: str = "master") -> List[Com
     try:
         logger.info(f"Запрос коммитов для {repo_url} (ветка: {branch}) по URL: {commits_url}")
         response = requests.get(commits_url, headers=headers, timeout=15)
-        response.raise_for_status()  # Вызывает исключение для HTTP ошибок (4xx, 5xx)
+        response.raise_for_status()
         
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # Ищем все ссылки, которые содержат и текст (название коммита), и ведут на коммит
         for link in soup.find_all("a", href=lambda x: x and "/commit/" in x):
             if len(found_commits) >= 10:
                 break
@@ -96,11 +84,10 @@ def get_commits_from_gitverse(repo_url: str, branch: str = "master") -> List[Com
             commit_url = f"https://gitverse.ru{link['href']}" if not link['href'].startswith('http') else link['href']
             commit_message = link.text.strip()
             
-            # Извлекаем хэш из URL коммита
             match = re.search(r'/commit/([0-9a-fA-F]+)', commit_url)
             commit_hash = match.group(1) if match else None
             
-            if commit_hash and commit_message:  # Если есть текст и хэш
+            if commit_hash and commit_message:
                 found_commits.append(CommitInfo(hash=commit_hash, message=commit_message))
             else:
                 logger.warning(f"Не удалось извлечь хэш или сообщение из ссылки: {link}")
@@ -113,10 +100,41 @@ def get_commits_from_gitverse(repo_url: str, branch: str = "master") -> List[Com
         found_commits.append(CommitInfo(hash="error", message=f"Ошибка парсинга: {e}"))
             
     logger.info(f"Возвращено {len(found_commits)} коммитов для {repo_url}.")
-    return found_commits[:10] # Гарантируем не более 10
+    return found_commits[:10]
+
+def _execute_remote_command(ssh_client: paramiko.SSHClient, command: str, error_message: str, output_log: List[str]) -> Tuple[str, str]:
+    """
+    Выполняет команду на удаленном сервере через SSH и обрабатывает вывод.
+    Возвращает (stdout, stderr). Вызывает исключение при ошибке.
+    """
+    logger.info(f"Выполнение команды: {command}")
+    stdin, stdout, stderr = ssh_client.exec_command(command)
+    out = stdout.read().decode().strip()
+    err = stderr.read().decode().strip()
+    exit_status = stdout.channel.recv_exit_status() # Получаем код выхода команды
+
+    output_log.append(f"Команда: {command}")
+    if out:
+        output_log.append(f"STDOUT:\n{out}")
+    if err:
+        output_log.append(f"STDERR:\n{err}")
+
+    # Проверяем код выхода и наличие явных ошибок в stderr
+    if exit_status != 0:
+        # Игнорируем некоторые "ошибки", которые на самом деле не являются критичными
+        if "already on" in err.lower() or "already at" in err.lower() or "detached head" in err.lower():
+            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {command}\n{err}")
+        elif "no such service" in err.lower() or "no such container" in err.lower() or "cannot find" in err.lower():
+            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {command}\n{err}")
+        else:
+            logger.error(f"Команда завершилась с ошибкой (exit status {exit_status}): {command}\n{err}")
+            raise Exception(f"{error_message}: {err}")
+    elif err: # Если exit_status 0, но есть что-то в stderr (могут быть предупреждения)
+        logger.warning(f"Команда завершилась успешно, но с предупреждениями в STDERR: {command}\n{err}")
+    
+    return out, err
 
 
-# --- API Эндпоинты ---
 @app.get("/repos", response_model=List[Dict])
 async def get_repositories():
     """
@@ -142,7 +160,7 @@ async def get_repositories():
                 "user": repo_config["server"]["user"],
                 "deploy_path": repo_config["server"]["deploy_path"]
             },
-            "commits": [commit.model_dump() for commit in commits] # Конвертируем Pydantic модель в dict
+            "commits": [commit.model_dump() for commit in commits]
         })
     logger.info(f"Сформирован список из {len(repo_list)} репозиториев для фронтенда.")
     return repo_list
@@ -180,84 +198,37 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
             hostname=server_ip,
             username=server_user,
             key_filename=ssh_key_path,
-            timeout=30 # Таймаут подключения SSH
+            timeout=30
         )
         output_log.append(f"Успешно подключено к {server_ip}")
         logger.info(f"Подключение к {server_ip} установлено.")
 
-        # 1. Проверка и создание директории
-        cmd_mkdir = f"mkdir -p {deploy_path}"
-        logger.info(f"Выполнение: {cmd_mkdir}")
-        stdin, stdout, stderr = ssh.exec_command(cmd_mkdir)
-        err = stderr.read().decode().strip()
-        if err:
-            output_log.append(f"Внимание: Ошибка при создании директории (возможно, уже существует): {err}")
-            logger.warning(f"Ошибка при создании директории {deploy_path} на {server_ip}: {err}")
-        else:
-            output_log.append(f"Директория {deploy_path} проверена/создана.")
+        _execute_remote_command(ssh, f"mkdir -p {deploy_path}", "Ошибка при создании директории", output_log)
+        output_log.append(f"Директория {deploy_path} проверена/создана.")
 
-        # 2. Клонирование или обновление репозитория
-        cmd_check_repo = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
-        stdin, stdout, stderr = ssh.exec_command(cmd_check_repo)
-        repo_status = stdout.read().decode().strip()
+        repo_status_cmd = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
+        repo_status_out, _ = _execute_remote_command(ssh, repo_status_cmd, "Ошибка проверки статуса репозитория", output_log)
+        repo_status = repo_status_out.strip()
         logger.info(f"Статус репозитория в {deploy_path} на {server_ip}: {repo_status}")
 
         if repo_status == "not_exists":
-            cmd_git_clone = f"cd {deploy_path} && git clone {repo['git_url']} ."
-            logger.info(f"Клонирование репозитория '{repo_name}' из {repo['git_url']} в {deploy_path}...")
-            output_log.append(f"Клонирование репозитория {repo['git_url']}...")
-            stdin, stdout, stderr = ssh.exec_command(cmd_git_clone)
-            out = stdout.read().decode()
-            err = stderr.read().decode()
-            output_log.append(out)
-            if err and "error" in err.lower():
-                output_log.append(f"Ошибка клонирования: {err}")
-                raise Exception(f"Ошибка клонирования: {err}")
-            logger.info("Клонирование завершено.")
+            _execute_remote_command(ssh, f"cd {deploy_path} && git clone {repo['git_url']} .", "Ошибка клонирования", output_log)
+            output_log.append(f"Клонирование репозитория {repo['git_url']} завершено.")
         else:
-            cmd_git_pull = f"cd {deploy_path} && git fetch --all && git reset --hard origin/{repo.get('branch', 'main')}"
-            logger.info(f"Обновление репозитория '{repo_name}' в {deploy_path}...")
-            output_log.append("Обновление репозитория...")
-            stdin, stdout, stderr = ssh.exec_command(cmd_git_pull)
-            out = stdout.read().decode()
-            err = stderr.read().decode()
-            output_log.append(out)
-            if err and "error" in err.lower():
-                output_log.append(f"Ошибка обновления: {err}")
-                raise Exception(f"Ошибка обновления: {err}")
-            logger.info("Обновление завершено.")
+            _execute_remote_command(ssh, f"cd {deploy_path} && git fetch --all && git reset --hard origin/{repo.get('branch', 'main')}", "Ошибка обновления репозитория", output_log)
+            output_log.append("Обновление репозитория завершено.")
         
-        # 3. Переключение на коммит
-        cmd_git_checkout = f"cd {deploy_path} && git checkout {commit_hash}"
-        logger.info(f"Переключение '{repo_name}' на коммит '{commit_hash}'...")
-        output_log.append(f"Переключение на коммит {commit_hash}...")
-        stdin, stdout, stderr = ssh.exec_command(cmd_git_checkout)
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        output_log.append(out)
-        if err and "error" in err.lower() and "already on" not in err.lower() and "already at" not in err.lower():
-            output_log.append(f"Ошибка переключения на коммит: {err}")
-            raise Exception(f"Ошибка переключения на коммит: {err}")
-        logger.info(f"Переключение на коммит '{commit_hash}' завершено.")
+        _execute_remote_command(ssh, f"cd {deploy_path} && git checkout {commit_hash}", "Ошибка переключения на коммит", output_log)
+        output_log.append(f"Переключение на коммит {commit_hash} завершено.")
 
-        # 4. Docker Compose действия: остановка, сборка, запуск
         docker_commands = [
             f"cd {deploy_path}",
-            f"docker-compose down", # Останавливаем и удаляем неиспользуемые контейнеры
-            f"docker-compose build", # Пересобираем образы
-            f"docker-compose up -d" # Запускаем в фоновом режиме
+            f"docker-compose down",
+            f"docker-compose build",
+            f"docker-compose up -d"
         ]
-        cmd_docker_compose = " && ".join(docker_commands)
-        logger.info(f"Выполнение Docker Compose команд для '{repo_name}' в {deploy_path}...")
-        output_log.append("Выполнение Docker Compose команд (down, build, up -d)...")
-        stdin, stdout, stderr = ssh.exec_command(cmd_docker_compose)
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        output_log.append(out)
-        if err and "error" in err.lower():
-            output_log.append(f"Ошибка Docker Compose: {err}")
-            raise Exception(f"Ошибка Docker Compose: {err}")
-        logger.info(f"Docker Compose действия для '{repo_name}' завершены.")
+        _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose", output_log)
+        output_log.append("Docker Compose действия (down, build, up -d) завершены.")
 
         logger.info(f"Деплой '{repo_name}' на коммит '{commit_hash}' успешно завершен.")
         return {"status": "success", "output": "\n".join(output_log)}
@@ -314,28 +285,18 @@ async def run_microservice(repo_name: str):
 
         # Проверяем наличие репозитория перед попыткой запуска docker-compose
         cmd_check_repo_exists = f'[ -d {deploy_path}/.git ]'
-        stdin, stdout, stderr = ssh.exec_command(cmd_check_repo_exists)
-        if stdout.channel.recv_exit_status() != 0: # Если команда вернула ошибку (директории нет)
-            output_log.append(f"Ошибка: Репозиторий не найден в {deploy_path}. Сначала выполните 'Установить версию'.")
-            logger.error(f"Репозиторий не найден в {deploy_path} для '{repo_name}'.")
-            raise HTTPException(status_code=400, detail="Репозиторий не найден на сервере. Сначала выполните 'Установить версию'.")
+        _, err = _execute_remote_command(ssh, cmd_check_repo_exists, "Ошибка проверки наличия репозитория", output_log)
+        # Если команда проверки репозитория вернула ошибку (например, директории нет), то это проблема
+        if err: # Если err не пустой, значит что-то пошло не так с проверкой, даже если exit_status был 0
+             raise HTTPException(status_code=400, detail="Репозиторий не найден на сервере. Сначала выполните 'Установить версию'.")
 
-        # Команды для запуска/перезапуска Docker Compose
+
         docker_commands = [
             f"cd {deploy_path}",
-            f"docker-compose up -d" # Просто запускаем/перезапускаем
+            f"docker-compose up -d"
         ]
-        cmd_docker_compose = " && ".join(docker_commands)
-        logger.info(f"Выполнение Docker Compose up -d для '{repo_name}' в {deploy_path}...")
-        output_log.append("Выполнение Docker Compose up -d...")
-        stdin, stdout, stderr = ssh.exec_command(cmd_docker_compose)
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        output_log.append(out)
-        if err and "error" in err.lower():
-            output_log.append(f"Ошибка Docker Compose: {err}")
-            raise Exception(f"Ошибка Docker Compose: {err}")
-        logger.info(f"Docker Compose up -d для '{repo_name}' завершен.")
+        _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose при запуске", output_log)
+        output_log.append("Docker Compose up -d завершен.")
 
         logger.info(f"Микросервис '{repo_name}' успешно запущен/перезапущен.")
         return {"status": "success", "output": "\n".join(output_log)}
@@ -345,7 +306,7 @@ async def run_microservice(repo_name: str):
         raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: Проверьте SSH-ключ и права доступа. {e}")
     except paramiko.SSHException as e:
         logger.error(f"Ошибка SSH при запуске/выполнении команд на {server_ip}: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка SSH при запуске: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка SSH: Не удалось подключиться или выполнить команды. {e}")
     except Exception as e:
         logger.error(f"Неизвестная ошибка при запуске для '{repo_name}': {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка запуска: {e}")
@@ -390,44 +351,24 @@ async def stop_microservice(repo_name: str):
         output_log.append(f"Успешно подключено к {server_ip}")
         logger.info(f"Подключение к {server_ip} установлено.")
 
-        # Проверяем наличие репозитория перед попыткой остановки docker-compose
         cmd_check_repo_exists = f'[ -d {deploy_path}/.git ]'
-        stdin, stdout, stderr = ssh.exec_command(cmd_check_repo_exists)
-        if stdout.channel.recv_exit_status() != 0: # Если команда вернула ошибку (директории нет)
-            output_log.append(f"Ошибка: Репозиторий не найден в {deploy_path}. Невозможно остановить сервис.")
-            logger.error(f"Репозиторий не найден в {deploy_path} для '{repo_name}'.")
+        _, err = _execute_remote_command(ssh, cmd_check_repo_exists, "Ошибка проверки наличия репозитория", output_log)
+        if err:
             raise HTTPException(status_code=400, detail="Репозиторий не найден на сервере. Невозможно остановить сервис.")
 
-        # Команды для остановки Docker Compose
         docker_commands = [
             f"cd {deploy_path}",
             f"docker-compose down"
         ]
-        cmd_docker_compose = " && ".join(docker_commands)
-        logger.info(f"Выполнение Docker Compose down для '{repo_name}' в {deploy_path}...")
-        output_log.append("Выполнение Docker Compose down...")
-        stdin, stdout, stderr = ssh.exec_command(cmd_docker_compose)
-        out = stdout.read().decode()
-        err = stderr.read().decode()
-        output_log.append(out)
-
-        # Обрабатываем ошибки остановки: если сервис не запущен, это не всегда ошибка
-        if err and "error" in err.lower():
-            if "no such service" in err.lower() or "no such container" in err.lower() or "cannot find" in err.lower():
-                output_log.append(f"Предупреждение: Сервис '{repo_name}' не был запущен или не найден. {err}")
-                logger.warning(f"Сервис '{repo_name}' не был запущен для остановки: {err}")
-            else:
-                output_log.append(f"Ошибка Docker Compose при остановке: {err}")
-                raise Exception(f"Ошибка Docker Compose при остановке: {err}")
-        else:
-            logger.info(f"Docker Compose down для '{repo_name}' завершен.")
+        _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose при остановке", output_log)
+        output_log.append("Docker Compose down завершен.")
 
         logger.info(f"Микросервис '{repo_name}' успешно остановлен.")
         return {"status": "success", "output": "\n".join(output_log)}
 
     except paramiko.AuthenticationException as e:
         logger.error(f"Ошибка аутентификации при остановке {server_ip}: {e}")
-        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации при остановке: {e}")
+        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: Проверьте SSH-ключ и права доступа. {e}")
     except paramiko.SSHException as e:
         logger.error(f"Ошибка SSH при остановке/выполнении команд на {server_ip}: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка SSH при остановке: {e}")

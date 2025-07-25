@@ -3,11 +3,11 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Менеджер Деплоя Микросервисов</title>
+    <title>Менеджер Микросервисов</title>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
     <style>
         body {
-            font-family: 'Inter', sans-serif; /* Использование Inter, если доступен */
+            font-family: 'Inter', sans-serif;
             margin: 0;
             padding: 20px;
             background-color: #f0f2f5;
@@ -82,7 +82,7 @@
             font-size: 1em;
             min-width: 180px;
             background-color: #fff;
-            appearance: none; /* Убираем стандартную стрелку */
+            appearance: none;
             background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22292.4%22%20height%3D%22292.4%22%20viewBox%3D%220%200%20292.4%20292.4%22%3E%3Cpath%20fill%3D%22%23333%22%20d%3D%22M287%2C197.6l-131.3%2C131.3c-4.1%2C4.1-9.4%2C6.2-14.7%2C6.2s-10.6-2.1-14.7-6.2L5.4%2C197.6c-8.1-8.1-8.1-21.3%2C0-29.4s21.3-8.1%2C29.4%2C0l116.7%2C116.7l116.7-116.7c8.1-8.1%2C21.3-8.1%2C29.4%2C0S295.1%2C189.5%2C287%2C197.6z%22%2F%3E%3C%2Fsvg%3E');
             background-repeat: no-repeat;
             background-position: right 10px top 50%;
@@ -102,25 +102,25 @@
             transform: translateY(1px);
         }
         .actions button.deploy {
-            background-color: #2ecc71; /* Emerald Green */
+            background-color: #2ecc71;
             color: white;
         }
         .actions button.deploy:hover {
-            background-color: #27ae60; /* Darker Emerald */
+            background-color: #27ae60;
         }
         .actions button.run {
-            background-color: #3498db; /* Peter River Blue */
+            background-color: #3498db;
             color: white;
         }
         .actions button.run:hover {
-            background-color: #2980b9; /* Darker Peter River */
+            background-color: #2980b9;
         }
         .actions button.stop {
-            background-color: #e74c3c; /* Alizarin Red */
+            background-color: #e74c3c;
             color: white;
         }
         .actions button.stop:hover {
-            background-color: #c0392b; /* Darker Alizarin */
+            background-color: #c0392b;
         }
         .log {
             background-color: #f0f0f0;
@@ -160,24 +160,23 @@
             border: 1px solid #b2ebf2;
         }
         .status-message::before {
-            content: '✓'; /* Checkmark for success */
+            content: '✓';
             margin-right: 8px;
             font-size: 1.2em;
             line-height: 1;
         }
         .status-message.error::before {
-            content: '✕'; /* Cross for error */
+            content: '✕';
             color: #dc3545;
         }
         .status-message.loading::before {
-            content: '↻'; /* Spinner for loading */
+            content: '↻';
             animation: spin 1s linear infinite;
         }
         @keyframes spin {
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
-        /* Responsive adjustments */
         @media (max-width: 768px) {
             .container {
                 padding: 20px;
@@ -199,7 +198,7 @@
 </head>
 <body>
     <div id="app" class="container">
-        <h1>Менеджер Деплоя Микросервисов</h1>
+        <h1>Менеджер Микросервисов</h1>
         <div v-if="loading" class="status-message loading">
             Загрузка репозиториев...
         </div>
@@ -217,14 +216,14 @@
                 <p><strong>Путь деплоя:</strong> {{ repo.server_info.deploy_path }}</p>
                 
                 <div class="actions">
-                    <label :for="'commit-select-' + repo.name">Выбрать версию:</label>
+                    <label :for="'commit-select-' + repo.name">Версия:</label>
                     <select :id="'commit-select-' + repo.name" v-model="repo.selectedCommitHash">
                         <option v-if="repo.commits.length === 0" value="" disabled>Коммиты не найдены</option>
                         <option v-for="commit in repo.commits" :value="commit.hash">
                             {{ commit.message }} ({{ commit.hash.substring(0, 7) }})
                         </option>
                     </select>
-                    <button class="deploy" @click="deployCommit(repo)">Установить версию</button>
+                    <button class="deploy" @click="deployCommit(repo)">Установить</button>
                     <button class="run" @click="runMicroservice(repo)">Запустить</button>
                     <button class="stop" @click="stopMicroservice(repo)">Остановить</button>
                 </div>
@@ -239,8 +238,6 @@
     </div>
 
     <script>
-        // ИЗМЕНЕНО: API_BASE_URL теперь указывает на проброшенный порт бэкенда на хост-машине.
-        // Это необходимо, так как браузер не может разрешить "backend" внутри Docker-сети.
         const API_BASE_URL = "http://localhost:8000"; 
 
         const app = Vue.createApp({
@@ -261,7 +258,6 @@
                     try {
                         const response = await fetch(`${API_BASE_URL}/repos`);
                         if (!response.ok) {
-                            // Попробуем получить текст ошибки из ответа, если доступно
                             const errorText = await response.text();
                             throw new Error(`HTTP ошибка! Статус: ${response.status}. Ответ: ${errorText.substring(0, 100)}...`);
                         }
@@ -285,7 +281,7 @@
                     }
                 },
                 async executeAction(repo, endpoint, actionName, payload = {}) {
-                    repo.logMessage = `Инициирую ${actionName.toLowerCase()}...`;
+                    repo.logMessage = `${actionName.toLowerCase()}...`;
                     repo.statusMessage = "";
                     repo.statusType = "loading";
 
