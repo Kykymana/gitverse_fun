@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Менеджер Деплоя Микросервисов</title>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <style>
+        body {
+            font-family: 'Inter', sans-serif; /* Использование Inter, если доступен */
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f2f5;
+            color: #333;
+            display: flex;
+            justify-content: center;
+            align-items: flex-start;
+            min-height: 100vh;
+        }
+        .container {
+            width: 100%;
+            max-width: 960px;
+            background: #ffffff;
+            padding: 30px;
+            border-radius: 12px;
+            box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+            border: 1px solid #e0e0e0;
+        }
+        h1 {
+            text-align: center;
+            color: #2c3e50;
+            margin-bottom: 30px;
+            font-size: 2.2em;
+            font-weight: 600;
+        }
+        .repo-card {
+            background-color: #fdfdfd;
+            border: 1px solid #e0e0e0;
+            border-radius: 10px;
+            padding: 20px;
+            margin-bottom: 25px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.05);
+            transition: transform 0.2s ease-in-out;
+        }
+        .repo-card:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+        }
+        .repo-card h2 {
+            margin-top: 0;
+            color: #3498db;
+            font-size: 1.8em;
+            border-bottom: 1px solid #eee;
+            padding-bottom: 10px;
+            margin-bottom: 15px;
+        }
+        .repo-card p {
+            margin: 8px 0;
+            font-size: 0.95em;
+            line-height: 1.5;
+        }
+        .repo-card strong {
+            color: #555;
+        }
+        .actions {
+            margin-top: 20px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            align-items: center;
+        }
+        .actions label {
+            font-weight: bold;
+            color: #555;
+            flex-shrink: 0;
+        }
+        .actions select {
+            flex-grow: 1;
+            padding: 10px 15px;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            font-size: 1em;
+            min-width: 180px;
+            background-color: #fff;
+            appearance: none; /* Убираем стандартную стрелку */
+            background-image: url('data:image/svg+xml;charset=US-ASCII,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%22292.4%22%20height%3D%22292.4%22%20viewBox%3D%220%200%20292.4%20292.4%22%3E%3Cpath%20fill%3D%22%23333%22%20d%3D%22M287%2C197.6l-131.3%2C131.3c-4.1%2C4.1-9.4%2C6.2-14.7%2C6.2s-10.6-2.1-14.7-6.2L5.4%2C197.6c-8.1-8.1-8.1-21.3%2C0-29.4s21.3-8.1%2C29.4%2C0l116.7%2C116.7l116.7-116.7c8.1-8.1%2C21.3-8.1%2C29.4%2C0S295.1%2C189.5%2C287%2C197.6z%22%2F%3E%3C%2Fsvg%3E');
+            background-repeat: no-repeat;
+            background-position: right 10px top 50%;
+            background-size: 12px auto;
+        }
+        .actions button {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            transition: background-color 0.3s ease, transform 0.1s ease;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .actions button:active {
+            transform: translateY(1px);
+        }
+        .actions button.deploy {
+            background-color: #2ecc71; /* Emerald Green */
+            color: white;
+        }
+        .actions button.deploy:hover {
+            background-color: #27ae60; /* Darker Emerald */
+        }
+        .actions button.run {
+            background-color: #3498db; /* Peter River Blue */
+            color: white;
+        }
+        .actions button.run:hover {
+            background-color: #2980b9; /* Darker Peter River */
+        }
+        .actions button.stop {
+            background-color: #e74c3c; /* Alizarin Red */
+            color: white;
+        }
+        .actions button.stop:hover {
+            background-color: #c0392b; /* Darker Alizarin */
+        }
+        .log {
+            background-color: #f0f0f0;
+            padding: 15px;
+            border-radius: 8px;
+            margin-top: 20px;
+            font-family: 'Courier New', Courier, monospace;
+            white-space: pre-wrap;
+            max-height: 250px;
+            overflow-y: auto;
+            border: 1px solid #d0d0d0;
+            font-size: 0.85em;
+            color: #333;
+        }
+        .status-message {
+            margin-top: 15px;
+            padding: 12px;
+            border-radius: 8px;
+            font-weight: bold;
+            font-size: 0.95em;
+            display: flex;
+            align-items: center;
+        }
+        .status-message.success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status-message.error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status-message.loading {
+            background-color: #e0f7fa;
+            color: #00796b;
+            border: 1px solid #b2ebf2;
+        }
+        .status-message::before {
+            content: '✓'; /* Checkmark for success */
+            margin-right: 8px;
+            font-size: 1.2em;
+            line-height: 1;
+        }
+        .status-message.error::before {
+            content: '✕'; /* Cross for error */
+            color: #dc3545;
+        }
+        .status-message.loading::before {
+            content: '↻'; /* Spinner for loading */
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .container {
+                padding: 20px;
+                margin: 10px;
+            }
+            h1 {
+                font-size: 1.8em;
+            }
+            .actions {
+                flex-direction: column;
+                align-items: stretch;
+            }
+            .actions button, .actions select {
+                width: 100%;
+                min-width: unset;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div id="app" class="container">
+        <h1>Менеджер Деплоя Микросервисов</h1>
+        <div v-if="loading" class="status-message loading">
+            Загрузка репозиториев...
+        </div>
+        <div v-else-if="error" class="status-message error">
+            Ошибка загрузки репозиториев: {{ error }}
+        </div>
+        <div v-else-if="repos.length === 0">
+            <p class="status-message">Репозитории не настроены или не найдены в config.json.</p>
+        </div>
+        <div v-else>
+            <div v-for="repo in repos" :key="repo.name" class="repo-card">
+                <h2>{{ repo.name }}</h2>
+                <p><strong>Ветка:</strong> {{ repo.branch }}</p>
+                <p><strong>IP сервера:</strong> {{ repo.server_info.ip }}</p>
+                <p><strong>Путь деплоя:</strong> {{ repo.server_info.deploy_path }}</p>
+                
+                <div class="actions">
+                    <label :for="'commit-select-' + repo.name">Выбрать версию:</label>
+                    <select :id="'commit-select-' + repo.name" v-model="repo.selectedCommitHash">
+                        <option v-if="repo.commits.length === 0" value="" disabled>Коммиты не найдены</option>
+                        <option v-for="commit in repo.commits" :value="commit.hash">
+                            {{ commit.message }} ({{ commit.hash.substring(0, 7) }})
+                        </option>
+                    </select>
+                    <button class="deploy" @click="deployCommit(repo)">Установить версию</button>
+                    <button class="run" @click="runMicroservice(repo)">Запустить</button>
+                    <button class="stop" @click="stopMicroservice(repo)">Остановить</button>
+                </div>
+                <div :id="'log-' + repo.name" class="log" v-show="repo.logMessage">
+                    {{ repo.logMessage }}
+                </div>
+                <div :id="'status-' + repo.name" :class="['status-message', repo.statusType]" v-show="repo.statusMessage">
+                    {{ repo.statusMessage }}
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // ИЗМЕНЕНО: API_BASE_URL теперь указывает на проброшенный порт бэкенда на хост-машине.
+        // Это необходимо, так как браузер не может разрешить "backend" внутри Docker-сети.
+        const API_BASE_URL = "http://localhost:8000"; 
+
+        const app = Vue.createApp({
+            data() {
+                return {
+                    repos: [],
+                    loading: true,
+                    error: null
+                };
+            },
+            mounted() {
+                this.fetchRepos();
+            },
+            methods: {
+                async fetchRepos() {
+                    this.loading = true;
+                    this.error = null;
+                    try {
+                        const response = await fetch(`${API_BASE_URL}/repos`);
+                        if (!response.ok) {
+                            // Попробуем получить текст ошибки из ответа, если доступно
+                            const errorText = await response.text();
+                            throw new Error(`HTTP ошибка! Статус: ${response.status}. Ответ: ${errorText.substring(0, 100)}...`);
+                        }
+                        const reposData = await response.json();
+                        this.repos = reposData.map(repo => ({
+                            ...repo,
+                            // Выбираем первый коммит по умолчанию, если есть
+                            selectedCommitHash: repo.commits.length > 0 ? repo.commits[0].hash : '', 
+                            logMessage: '',
+                            statusMessage: '',
+                            statusType: ''
+                        }));
+                        if (this.repos.length === 0) {
+                            this.error = "Репозитории не настроены в config.json или не удалось получить данные.";
+                        }
+                    } catch (err) {
+                        console.error("Ошибка при получении репозиториев:", err);
+                        this.error = `Сетевая ошибка или CORS: ${err.message}. Убедитесь, что бэкенд запущен на ${API_BASE_URL} и разрешает CORS-запросы с ${window.location.origin}.`;
+                    } finally {
+                        this.loading = false;
+                    }
+                },
+                async executeAction(repo, endpoint, actionName, payload = {}) {
+                    repo.logMessage = `Инициирую ${actionName.toLowerCase()}...`;
+                    repo.statusMessage = "";
+                    repo.statusType = "loading";
+
+                    try {
+                        const response = await fetch(`${API_BASE_URL}/${endpoint}/${repo.name}`, {
+                            method: "POST",
+                            headers: {
+                                "Content-Type": "application/json",
+                            },
+                            body: JSON.stringify(payload),
+                        });
+
+                        const result = await response.json();
+
+                        if (response.ok) {
+                            repo.logMessage = result.output || `${actionName} успешно завершен.`;
+                            repo.statusType = "success";
+                            repo.statusMessage = `${actionName} успешно завершен для ${repo.name}.`;
+                        } else {
+                            repo.logMessage = result.details || `${actionName} не удался.`;
+                            repo.statusType = "error";
+                            repo.statusMessage = `${actionName} не удался для ${repo.name}: ${result.detail || 'Неизвестная ошибка'}`;
+                        }
+                    } catch (err) {
+                        console.error(`Ошибка во время ${actionName.toLowerCase()}:`, err);
+                        repo.logMessage = `Ошибка во время ${actionName.toLowerCase()}: ${err.message}`;
+                        repo.statusType = "error";
+                        repo.statusMessage = `${actionName} не удался для ${repo.name}: ${err.message}`;
+                    }
+                },
+                async deployCommit(repo) {
+                    if (!repo.selectedCommitHash) {
+                        repo.statusMessage = "Пожалуйста, выберите коммит для установки.";
+                        repo.statusType = "error";
+                        return;
+                    }
+                    await this.executeAction(repo, 'deploy', 'Установка версии', { commit_hash: repo.selectedCommitHash });
+                },
+                async runMicroservice(repo) {
+                    await this.executeAction(repo, 'run', 'Запуск микросервиса');
+                },
+                async stopMicroservice(repo) {
+                    await this.executeAction(repo, 'stop', 'Остановка микросервиса');
+                }
+            }
+        });
+
+        app.mount('#app');
+    </script>
+</body>
+</html>

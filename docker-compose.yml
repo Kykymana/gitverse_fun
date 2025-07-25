@@ -1,0 +1,33 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  backend:
+    build: ./backend
+    ports:
+      - "8000:8000" # Проброс порта FastAPI на хост
+    volumes:
+      # ВАЖНО: Замените `/path/to/your/ssh/key/id_rsa` на АБСОЛЮТНЫЙ ПУТЬ к вашему приватному SSH-ключу
+      # на вашей ХОСТ-МАШИНЕ (где вы запускаете Docker Compose).
+      # Путь `/app/ssh_keys/id_rsa_deploy` - это путь ВНУТРИ контейнера,
+      # который должен совпадать с тем, что указан в config.json.
+      - /path/to/your/ssh/key/id_rsa:/app/ssh_keys/id_rsa_deploy:ro
+    networks:
+      - app_network
+    # Опционально: перезапускать, если контейнер упал
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8888:80" # Фронтенд будет доступен на порту 8888 хост-машины
+    depends_on:
+      - backend # Убедимся, что бэкенд запущен перед фронтендом
+    networks:
+      - app_network
+    # Опционально: перезапускать, если контейнер упал
+    restart: unless-stopped
+
+networks:
+  app_network:
+    driver: bridge
