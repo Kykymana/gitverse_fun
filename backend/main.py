@@ -8,6 +8,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Tuple
+import subprocess
+import os
+import tempfile
+import shutil
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -59,81 +63,87 @@ def load_config_on_startup():
 async def startup_event():
     load_config_on_startup()
 
-def get_commits_from_gitverse(repo_url: str, branch: str = "master") -> List[CommitInfo]:
-    """
-    Получает последние 10 коммитов (хэш и сообщение) из GitVerse для заданного репозитория и ветки.
-    Адаптировано из предоставленного пользователем кода.
-    """
-    commits_url = f"{repo_url}/commits/branch/{branch}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-    }
-    
-    found_commits = []
-    try:
-        logger.info(f"Запрос коммитов для {repo_url} (ветка: {branch}) по URL: {commits_url}")
-        response = requests.get(commits_url, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        soup = BeautifulSoup(response.text, "html.parser")
-        
-        for link in soup.find_all("a", href=lambda x: x and "/commit/" in x):
-            if len(found_commits) >= 10:
-                break
-            
-            commit_url = f"https://gitverse.ru{link['href']}" if not link['href'].startswith('http') else link['href']
-            commit_message = link.text.strip()
-            
-            match = re.search(r'/commit/([0-9a-fA-F]+)', commit_url)
-            commit_hash = match.group(1) if match else None
-            
-            if commit_hash and commit_message:
-                found_commits.append(CommitInfo(hash=commit_hash, message=commit_message))
-            else:
-                logger.warning(f"Не удалось извлечь хэш или сообщение из ссылки: {link}")
-                
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка сети/HTTP при получении коммитов для {repo_url}: {e}")
-        found_commits.append(CommitInfo(hash="error", message=f"Ошибка сети/HTTP: {e}"))
-    except Exception as e:
-        logger.error(f"Общая ошибка при парсинге коммитов для {repo_url}: {e}")
-        found_commits.append(CommitInfo(hash="error", message=f"Ошибка парсинга: {e}"))
-            
-    logger.info(f"Возвращено {len(found_commits)} коммитов для {repo_url}.")
-    return found_commits[:10]
-
-def _execute_remote_command(ssh_client: paramiko.SSHClient, command: str, error_message: str, output_log: List[str]) -> Tuple[str, str]:
+def _execute_remote_command(ssh_client: paramiko.SSHClient, command: str, error_message: str, output_log: List[str], prepend_commands: Optional[str] = None) -> Tuple[str, str]:
     """
     Выполняет команду на удаленном сервере через SSH и обрабатывает вывод.
     Возвращает (stdout, stderr). Вызывает исключение при ошибке.
     """
-    logger.info(f"Выполнение команды: {command}")
-    stdin, stdout, stderr = ssh_client.exec_command(command)
+    full_command = f"{prepend_commands} && {command}" if prepend_commands else command
+    logger.info(f"Выполнение команды: {full_command}")
+    stdin, stdout, stderr = ssh_client.exec_command(full_command)
     out = stdout.read().decode().strip()
     err = stderr.read().decode().strip()
-    exit_status = stdout.channel.recv_exit_status() # Получаем код выхода команды
+    exit_status = stdout.channel.recv_exit_status()
 
-    output_log.append(f"Команда: {command}")
+    output_log.append(f"Команда: {full_command}")
     if out:
         output_log.append(f"STDOUT:\n{out}")
     if err:
         output_log.append(f"STDERR:\n{err}")
 
-    # Проверяем код выхода и наличие явных ошибок в stderr
     if exit_status != 0:
-        # Игнорируем некоторые "ошибки", которые на самом деле не являются критичными
         if "already on" in err.lower() or "already at" in err.lower() or "detached head" in err.lower():
-            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {command}\n{err}")
+            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {full_command}\n{err}")
         elif "no such service" in err.lower() or "no such container" in err.lower() or "cannot find" in err.lower():
-            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {command}\n{err}")
+            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {full_command}\n{err}")
         else:
-            logger.error(f"Команда завершилась с ошибкой (exit status {exit_status}): {command}\n{err}")
+            logger.error(f"Команда завершилась с ошибкой (exit status {exit_status}): {full_command}\n{err}")
             raise Exception(f"{error_message}: {err}")
-    elif err: # Если exit_status 0, но есть что-то в stderr (могут быть предупреждения)
-        logger.warning(f"Команда завершилась успешно, но с предупреждениями в STDERR: {command}\n{err}")
+    elif err:
+        logger.warning(f"Команда завершилась успешно, но с предупреждениями в STDERR: {full_command}\n{err}")
     
     return out, err
 
+def get_commits_from_git_repo(repo_url: str, branch: str = "main", ssh_key_path: Optional[str] = None) -> List[CommitInfo]:
+    """
+    Клонирует репозиторий в временную директорию и получает последние 10 коммитов
+    с помощью git log.
+    """
+    found_commits = []
+    temp_dir = None
+    try:
+        logger.info(f"Получение коммитов из репозитория {repo_url} (ветка: {branch}) через git clone.")
+        temp_dir = tempfile.mkdtemp()
+
+        ssh_port_match = re.search(r':(\d+)/', repo_url)
+        port_option = f"-p {ssh_port_match.group(1)}" if ssh_port_match else ""
+        
+        git_ssh_command_str = f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no {port_option}" if ssh_key_path else None
+
+        env = os.environ.copy()
+        if git_ssh_command_str:
+            env["GIT_SSH_COMMAND"] = git_ssh_command_str
+        
+        clone_command = ["git", "clone", "--depth", "10", "--branch", branch, repo_url, temp_dir]
+        
+        result = subprocess.run(clone_command, capture_output=True, text=True, check=True, env=env)
+        logger.info(f"Репозиторий {repo_url} успешно клонирован в {temp_dir}.")
+
+        log_command = ["git", "log", "--pretty=format:%H|%s", "-10"]
+        log_result = subprocess.run(log_command, cwd=temp_dir, capture_output=True, text=True, check=True)
+        
+        commits_output = log_result.stdout.strip().split('\n')
+        
+        for line in commits_output:
+            if line:
+                try:
+                    commit_hash, commit_message = line.split('|', 1)
+                    found_commits.append(CommitInfo(hash=commit_hash.strip(), message=commit_message.strip()))
+                except ValueError:
+                    logger.warning(f"Не удалось распарсить строку коммита: {line}")
+        
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Ошибка выполнения git-команды: {e.stderr}")
+        found_commits.append(CommitInfo(hash="error", message=f"Ошибка Git: {e.stderr.strip()}"))
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при получении коммитов: {e}")
+        found_commits.append(CommitInfo(hash="error", message=f"Неизвестная ошибка: {e}"))
+    finally:
+        if temp_dir:
+            shutil.rmtree(temp_dir)
+            logger.info(f"Временная директория {temp_dir} удалена.")
+            
+    return found_commits
 
 @app.get("/repos", response_model=List[Dict])
 async def get_repositories():
@@ -148,8 +158,9 @@ async def get_repositories():
         repo_name = repo_config["name"]
         git_url = repo_config["git_url"]
         branch = repo_config.get("branch", "main")
+        repo_ssh_key = repo_config.get("repo_ssh_key")
         
-        commits = get_commits_from_gitverse(git_url, branch)
+        commits = get_commits_from_git_repo(git_url, branch, repo_ssh_key)
         
         repo_list.append({
             "name": repo_name,
@@ -182,13 +193,16 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
     ssh_key_path = repo["server"]["ssh_key"]
     deploy_path = repo["server"]["deploy_path"]
     commit_hash = request.commit_hash
-    docker_compose_file = repo.get("docker_compose_file", "docker-compose.yml")
-
+    git_url = repo["git_url"]
+    repo_ssh_key = repo["repo_ssh_key"]
+    
     if not all([server_ip, server_user, ssh_key_path, deploy_path, commit_hash]):
         logger.error(f"Недостающие данные конфигурации для деплоя репозитория '{repo_name}'.")
         raise HTTPException(status_code=500, detail="Недостающие данные конфигурации для сервера или коммита")
 
     ssh = None
+    sftp = None
+    remote_repo_key_path = None
     output_log = []
     try:
         logger.info(f"Подключение к {server_user}@{server_ip} с ключом {ssh_key_path}...")
@@ -202,23 +216,40 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
         )
         output_log.append(f"Успешно подключено к {server_ip}")
         logger.info(f"Подключение к {server_ip} установлено.")
-
-        _execute_remote_command(ssh, f"mkdir -p {deploy_path}", "Ошибка при создании директории", output_log)
+        
+        # --- НОВОЕ: Копирование ключа репозитория на удаленный сервер ---
+        if repo_ssh_key:
+            sftp = paramiko.SFTPClient.from_transport(ssh.get_transport())
+            key_filename = os.path.basename(repo_ssh_key)
+            remote_repo_key_path = f"/tmp/{key_filename}"
+            sftp.put(repo_ssh_key, remote_repo_key_path)
+            # Установка правильных прав доступа на сервере
+            _execute_remote_command(ssh, f"chmod 600 {remote_repo_key_path}", "Ошибка установки прав на SSH-ключ", output_log)
+            logger.info(f"Ключ репозитория успешно скопирован в {remote_repo_key_path} на удаленном сервере.")
+        
+        # Парсим URL, чтобы извлечь порт, если он есть
+        ssh_port_match = re.search(r':(\d+)/', git_url)
+        port_option = f"-p {ssh_port_match.group(1)}" if ssh_port_match else ""
+        
+        # Создаем GIT_SSH_COMMAND для удаленного сервера, используя временный путь
+        git_ssh_command_str = f"export GIT_SSH_COMMAND=\"ssh -i {remote_repo_key_path} -o StrictHostKeyChecking=no {port_option}\""
+        
+        _execute_remote_command(ssh, f"mkdir -p {deploy_path}", "Ошибка при создании директории", output_log, prepend_commands=git_ssh_command_str)
         output_log.append(f"Директория {deploy_path} проверена/создана.")
 
         repo_status_cmd = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
-        repo_status_out, _ = _execute_remote_command(ssh, repo_status_cmd, "Ошибка проверки статуса репозитория", output_log)
+        repo_status_out, _ = _execute_remote_command(ssh, repo_status_cmd, "Ошибка проверки статуса репозитория", output_log, prepend_commands=git_ssh_command_str)
         repo_status = repo_status_out.strip()
         logger.info(f"Статус репозитория в {deploy_path} на {server_ip}: {repo_status}")
 
         if repo_status == "not_exists":
-            _execute_remote_command(ssh, f"cd {deploy_path} && git clone {repo['git_url']} .", "Ошибка клонирования", output_log)
-            output_log.append(f"Клонирование репозитория {repo['git_url']} завершено.")
+            _execute_remote_command(ssh, f"cd {deploy_path} && git clone {git_url} .", "Ошибка клонирования", output_log, prepend_commands=git_ssh_command_str)
+            output_log.append(f"Клонирование репозитория {git_url} завершено.")
         else:
-            _execute_remote_command(ssh, f"cd {deploy_path} && git fetch --all && git reset --hard origin/{repo.get('branch', 'main')}", "Ошибка обновления репозитория", output_log)
+            _execute_remote_command(ssh, f"cd {deploy_path} && git fetch --all --prune", "Ошибка обновления репозитория", output_log, prepend_commands=git_ssh_command_str)
             output_log.append("Обновление репозитория завершено.")
         
-        _execute_remote_command(ssh, f"cd {deploy_path} && git checkout {commit_hash}", "Ошибка переключения на коммит", output_log)
+        _execute_remote_command(ssh, f"cd {deploy_path} && git checkout -f {commit_hash}", "Ошибка переключения на коммит", output_log)
         output_log.append(f"Переключение на коммит {commit_hash} завершено.")
 
         docker_commands = [
@@ -244,6 +275,15 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
         raise HTTPException(status_code=500, detail=f"Ошибка деплоя: {e}")
     finally:
         if ssh:
+            # --- НОВОЕ: Удаление временного ключа с сервера ---
+            if sftp and remote_repo_key_path:
+                try:
+                    sftp.remove(remote_repo_key_path)
+                    logger.info(f"Временный ключ {remote_repo_key_path} успешно удален с сервера.")
+                except Exception as e:
+                    logger.warning(f"Не удалось удалить временный ключ с сервера: {e}")
+                finally:
+                    sftp.close()
             ssh.close()
             logger.info(f"SSH-соединение с {server_ip} закрыто.")
 
@@ -283,13 +323,10 @@ async def run_microservice(repo_name: str):
         output_log.append(f"Успешно подключено к {server_ip}")
         logger.info(f"Подключение к {server_ip} установлено.")
 
-        # Проверяем наличие репозитория перед попыткой запуска docker-compose
         cmd_check_repo_exists = f'[ -d {deploy_path}/.git ]'
         _, err = _execute_remote_command(ssh, cmd_check_repo_exists, "Ошибка проверки наличия репозитория", output_log)
-        # Если команда проверки репозитория вернула ошибку (например, директории нет), то это проблема
-        if err: # Если err не пустой, значит что-то пошло не так с проверкой, даже если exit_status был 0
+        if err:
              raise HTTPException(status_code=400, detail="Репозиторий не найден на сервере. Сначала выполните 'Установить версию'.")
-
 
         docker_commands = [
             f"cd {deploy_path}",
@@ -368,7 +405,7 @@ async def stop_microservice(repo_name: str):
 
     except paramiko.AuthenticationException as e:
         logger.error(f"Ошибка аутентификации при остановке {server_ip}: {e}")
-        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: Проверьте SSH-ключ и права доступа. {e}")
+        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации при остановке: {e}")
     except paramiko.SSHException as e:
         logger.error(f"Ошибка SSH при остановке/выполнении команд на {server_ip}: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка SSH при остановке: {e}")

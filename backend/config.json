@@ -2,24 +2,39 @@
   "repositories": [
     {
       "name": "service1",
-      "git_url": "https://gitverse.ru/Kykymana/service1",
+      "git_url": "ssh://git@gitverse.ru:2222/Kykymana/service1.git",
+      "repo_ssh_key": "./ssh_keys/gitverse",
       "branch": "master",
       "server": {
         "ip": "5.129.201.84",
         "user": "root",
-        "ssh_key": "./ti",
+        "ssh_key": "./ssh_keys/ti",
         "deploy_path": "./test"
       },
       "docker_compose_file": "docker-compose.yml"
     },
     {
       "name": "service2",
-      "git_url": "https://gitverse.ru/Kykymana/service2",
+      "git_url": "ssh://git@gitverse.ru:2222/Kykymana/service2.git",
+      "repo_ssh_key": "./ssh_keys/gitverse",
       "branch": "master",
       "server": {
         "ip": "147.45.141.186",
         "user": "root",
-        "ssh_key": "./ti",
+        "ssh_key": "./ssh_keys/ti",
+        "deploy_path": "./test"
+      },
+      "docker_compose_file": "docker-compose.yml"
+    },
+    {
+      "name": "service3",
+      "git_url": "ssh://git@gitverse.ru:2222/Kykymana/service3.git",
+      "repo_ssh_key": "./ssh_keys/gitverse",
+      "branch": "master",
+      "server": {
+        "ip": "147.45.141.186",
+        "user": "root",
+        "ssh_key": "./ssh_keys/ti",
         "deploy_path": "./test"
       },
       "docker_compose_file": "docker-compose.yml"
