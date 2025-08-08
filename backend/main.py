@@ -217,7 +217,6 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
         output_log.append(f"Успешно подключено к {server_ip}")
         logger.info(f"Подключение к {server_ip} установлено.")
         
-        # --- НОВОЕ: Копирование ключа репозитория на удаленный сервер ---
         if repo_ssh_key:
             sftp = paramiko.SFTPClient.from_transport(ssh.get_transport())
             key_filename = os.path.basename(repo_ssh_key)
@@ -227,11 +226,9 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
             _execute_remote_command(ssh, f"chmod 600 {remote_repo_key_path}", "Ошибка установки прав на SSH-ключ", output_log)
             logger.info(f"Ключ репозитория успешно скопирован в {remote_repo_key_path} на удаленном сервере.")
         
-        # Парсим URL, чтобы извлечь порт, если он есть
         ssh_port_match = re.search(r':(\d+)/', git_url)
         port_option = f"-p {ssh_port_match.group(1)}" if ssh_port_match else ""
         
-        # Создаем GIT_SSH_COMMAND для удаленного сервера, используя временный путь
         git_ssh_command_str = f"export GIT_SSH_COMMAND=\"ssh -i {remote_repo_key_path} -o StrictHostKeyChecking=no {port_option}\""
         
         _execute_remote_command(ssh, f"mkdir -p {deploy_path}", "Ошибка при создании директории", output_log, prepend_commands=git_ssh_command_str)
