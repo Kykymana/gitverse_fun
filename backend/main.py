@@ -12,6 +12,7 @@ import subprocess
 import os
 import tempfile
 import shutil
+from io import StringIO
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -94,6 +95,34 @@ def _execute_remote_command(ssh_client: paramiko.SSHClient, command: str, error_
     
     return out, err
 
+def _get_docker_ps_raw(ssh_client: paramiko.SSHClient, repo_name: str) -> str:
+    """
+    Получает отформатированный вывод `docker ps` для репозитория.
+    """
+    # Используем --format "table..." для вывода таблицы с заголовком и нужными полями.
+    # --filter используется для выбора контейнеров, связанных с репозиторием.
+    command = "docker ps --format 'table {{.Image}}\t{{.Status}}\t{{.Ports}}'"
+    stdin, stdout, stderr = ssh_client.exec_command(command)
+    
+    # Читаем весь вывод
+    output = stdout.read().decode()
+    error_output = stderr.read().decode()
+    
+    if output:
+        logger.info(f"STDOUT от 'docker ps':\n{output}")
+    if error_output:
+        logger.warning(f"STDERR от 'docker ps':\n{error_output}")
+    
+    if stdout.channel.recv_exit_status() != 0:
+        logger.error(f"Команда 'docker ps' завершилась с ошибкой. Вывод: {error_output}")
+        return f"Ошибка при получении статуса Docker: {error_output}"
+
+    # Если вывода больше одной строки (заголовок + данные), значит, контейнеры найдены.
+    if len(output.strip().splitlines()) > 1:
+        return output
+    else:
+        # Если вывода нет или только заголовок, значит, контейнеры не найдены.
+        return "Нет запущенных контейнеров Docker, связанных с этим репозиторием."
 def get_commits_from_git_repo(repo_url: str, branch: str = "main", ssh_key_path: Optional[str] = None) -> List[CommitInfo]:
     """
     Клонирует репозиторий в временную директорию и получает последние 10 коммитов
@@ -222,14 +251,13 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
             key_filename = os.path.basename(repo_ssh_key)
             remote_repo_key_path = f"/tmp/{key_filename}"
             sftp.put(repo_ssh_key, remote_repo_key_path)
-            # Установка правильных прав доступа на сервере
             _execute_remote_command(ssh, f"chmod 600 {remote_repo_key_path}", "Ошибка установки прав на SSH-ключ", output_log)
             logger.info(f"Ключ репозитория успешно скопирован в {remote_repo_key_path} на удаленном сервере.")
         
         ssh_port_match = re.search(r':(\d+)/', git_url)
         port_option = f"-p {ssh_port_match.group(1)}" if ssh_port_match else ""
-        
-        git_ssh_command_str = f"export GIT_SSH_COMMAND=\"ssh -i {remote_repo_key_path} -o StrictHostKeyChecking=no {port_option}\""
+
+        git_ssh_command_str = f"export GIT_SSH_COMMAND=\"ssh -i {remote_repo_key_path} -o StrictHostKeyChecking=no {port_option}\"" if remote_repo_key_path else ""
         
         _execute_remote_command(ssh, f"mkdir -p {deploy_path}", "Ошибка при создании директории", output_log, prepend_commands=git_ssh_command_str)
         output_log.append(f"Директория {deploy_path} проверена/создана.")
@@ -246,7 +274,7 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
             _execute_remote_command(ssh, f"cd {deploy_path} && git fetch --all --prune", "Ошибка обновления репозитория", output_log, prepend_commands=git_ssh_command_str)
             output_log.append("Обновление репозитория завершено.")
         
-        _execute_remote_command(ssh, f"cd {deploy_path} && git checkout -f {commit_hash}", "Ошибка переключения на коммит", output_log)
+        _execute_remote_command(ssh, f"cd {deploy_path} && git checkout -f {commit_hash}", "Ошибка переключения на коммит", output_log, prepend_commands=git_ssh_command_str)
         output_log.append(f"Переключение на коммит {commit_hash} завершено.")
 
         docker_commands = [
@@ -272,7 +300,6 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
         raise HTTPException(status_code=500, detail=f"Ошибка деплоя: {e}")
     finally:
         if ssh:
-            # --- НОВОЕ: Удаление временного ключа с сервера ---
             if sftp and remote_repo_key_path:
                 try:
                     sftp.remove(remote_repo_key_path)
@@ -281,6 +308,61 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
                     logger.warning(f"Не удалось удалить временный ключ с сервера: {e}")
                 finally:
                     sftp.close()
+            ssh.close()
+            logger.info(f"SSH-соединение с {server_ip} закрыто.")
+
+@app.get("/status/{repo_name}")
+async def get_repo_status(repo_name: str):
+    """
+    Получает необработанный вывод `docker ps` для указанного репозитория.
+    """
+    logger.info(f"Получен запрос на получение статуса для '{repo_name}'.")
+    repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
+    if not repo:
+        logger.error(f"Репозиторий '{repo_name}' не найден в конфигурации.")
+        raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
+
+    server_ip = repo["server"]["ip"]
+    server_user = repo["server"]["user"]
+    ssh_key_path = repo["server"]["ssh_key"]
+    deploy_path = repo["server"]["deploy_path"]
+
+    ssh = None
+    try:
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(
+            hostname=server_ip,
+            username=server_user,
+            key_filename=ssh_key_path,
+            timeout=30
+        )
+        logger.info(f"Подключение к {server_ip} установлено.")
+
+        # Проверяем, существует ли репозиторий на сервере
+        repo_status_cmd = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
+        stdin, stdout, stderr = ssh.exec_command(repo_status_cmd)
+        repo_exists = stdout.read().decode().strip() == "exists"
+        
+        if not repo_exists:
+            return {"status": "not_deployed", "output": "Сервис еще не установлен на сервере."}
+
+        # Получаем необработанный вывод docker ps
+        raw_docker_output = _get_docker_ps_raw(ssh, repo_name)
+        
+        return {"status": "deployed", "output": raw_docker_output}
+
+    except paramiko.AuthenticationException as e:
+        logger.error(f"Ошибка аутентификации при получении статуса с {server_ip}: {e}")
+        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: {e}")
+    except paramiko.SSHException as e:
+        logger.error(f"Ошибка SSH при получении статуса с {server_ip}: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка SSH: {e}")
+    except Exception as e:
+        logger.error(f"Неизвестная ошибка при получении статуса для '{repo_name}': {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка: {e}")
+    finally:
+        if ssh:
             ssh.close()
             logger.info(f"SSH-соединение с {server_ip} закрыто.")
 

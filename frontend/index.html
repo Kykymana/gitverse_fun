@@ -177,6 +177,32 @@
             0% { transform: rotate(0deg); }
             100% { transform: rotate(360deg); }
         }
+
+        .docker-status-section {
+            margin-top: 20px;
+            padding-top: 15px;
+            border-top: 1px dashed #e0e0e0;
+        }
+        .docker-status-section h3 {
+            margin-top: 0;
+            color: #555;
+            font-size: 1.2em;
+            font-weight: 600;
+        }
+        .docker-output {
+            background-color: #f0f0f0;
+            padding: 10px;
+            border-radius: 8px;
+            margin-top: 10px;
+            font-family: 'Courier New', Courier, monospace;
+            white-space: pre-wrap;
+            max-height: 200px;
+            overflow-y: auto;
+            border: 1px solid #d0d0d0;
+            font-size: 0.8em;
+            color: #333;
+        }
+        
         @media (max-width: 768px) {
             .container {
                 padding: 20px;
@@ -227,6 +253,17 @@
                     <button class="run" @click="runMicroservice(repo)">Запустить</button>
                     <button class="stop" @click="stopMicroservice(repo)">Остановить</button>
                 </div>
+
+                <div v-if="repo.dockerStatus" class="docker-status-section">
+                    <h3>Статус Docker-контейнеров</h3>
+                    <div v-if="repo.dockerStatus.status === 'not_deployed'" class="docker-output">
+                        {{ repo.dockerStatus.output }}
+                    </div>
+                    <div v-else>
+                        <pre class="docker-output">{{ repo.dockerStatus.output }}</pre>
+                    </div>
+                </div>
+
                 <div :id="'log-' + repo.name" class="log" v-show="repo.logMessage">
                     {{ repo.logMessage }}
                 </div>
@@ -239,6 +276,7 @@
 
     <script>
         const API_BASE_URL = "http://localhost:8000"; 
+        const REFRESH_INTERVAL = 5000; // 5 секунд
 
         const app = Vue.createApp({
             data() {
@@ -249,12 +287,10 @@
                 };
             },
             mounted() {
-                this.fetchRepos();
+                this.startPolling();
             },
             methods: {
                 async fetchRepos() {
-                    this.loading = true;
-                    this.error = null;
                     try {
                         const response = await fetch(`${API_BASE_URL}/repos`);
                         if (!response.ok) {
@@ -262,23 +298,64 @@
                             throw new Error(`HTTP ошибка! Статус: ${response.status}. Ответ: ${errorText.substring(0, 100)}...`);
                         }
                         const reposData = await response.json();
-                        this.repos = reposData.map(repo => ({
-                            ...repo,
-                            // Выбираем первый коммит по умолчанию, если есть
-                            selectedCommitHash: repo.commits.length > 0 ? repo.commits[0].hash : '', 
-                            logMessage: '',
-                            statusMessage: '',
-                            statusType: ''
-                        }));
-                        if (this.repos.length === 0) {
-                            this.error = "Репозитории не настроены в config.json или не удалось получить данные.";
-                        }
+                        
+                        this.repos = reposData.map(newRepo => {
+                            const existingRepo = this.repos.find(r => r.name === newRepo.name);
+                            if (existingRepo) {
+                                return {
+                                    ...existingRepo,
+                                    commits: newRepo.commits,
+                                };
+                            } else {
+                                return {
+                                    ...newRepo,
+                                    selectedCommitHash: newRepo.commits.length > 0 ? newRepo.commits[0].hash : '',
+                                    logMessage: '',
+                                    statusMessage: '',
+                                    statusType: '',
+                                    dockerStatus: null
+                                };
+                            }
+                        });
+                        this.loading = false;
+                        this.error = null;
                     } catch (err) {
                         console.error("Ошибка при получении репозиториев:", err);
-                        this.error = `Сетевая ошибка или CORS: ${err.message}. Убедитесь, что бэкенд запущен на ${API_BASE_URL} и разрешает CORS-запросы с ${window.location.origin}.`;
-                    } finally {
+                        this.error = `Сетевая ошибка или CORS: ${err.message}. Убедитесь, что бэкенд запущен на ${API_BASE_URL}.`;
                         this.loading = false;
                     }
+                },
+                async fetchStatusForRepo(repo) {
+                    try {
+                        const response = await fetch(`${API_BASE_URL}/status/${repo.name}`);
+                        if (response.ok) {
+                            const statusData = await response.json();
+                            repo.dockerStatus = statusData;
+                        } else {
+                            console.error(`Не удалось получить статус для ${repo.name}:`, response.status);
+                            repo.dockerStatus = { status: 'error', output: `HTTP статус: ${response.status}` };
+                        }
+                    } catch (err) {
+                        console.error(`Ошибка сети при получении статуса для ${repo.name}:`, err);
+                        repo.dockerStatus = { status: 'error', output: `Сетевая ошибка: ${err.message}` };
+                    }
+                },
+                startPolling() {
+                    // Первоначальная загрузка
+                    this.fetchRepos().then(() => {
+                        this.repos.forEach(repo => {
+                            this.fetchStatusForRepo(repo);
+                        });
+                    });
+
+                    // Периодическое обновление
+                    setInterval(() => {
+                        this.fetchRepos().then(() => {
+                            this.repos.forEach(repo => {
+                                this.fetchStatusForRepo(repo);
+                            });
+                        });
+                    }, REFRESH_INTERVAL);
                 },
                 async executeAction(repo, endpoint, actionName, payload = {}) {
                     repo.logMessage = `${actionName.toLowerCase()}...`;
@@ -310,6 +387,9 @@
                         repo.logMessage = `Ошибка во время ${actionName.toLowerCase()}: ${err.message}`;
                         repo.statusType = "error";
                         repo.statusMessage = `${actionName} не удался для ${repo.name}: ${err.message}`;
+                    } finally {
+                         // После выполнения действия, принудительно обновляем статус
+                        this.fetchStatusForRepo(repo);
                     }
                 },
                 async deployCommit(repo) {
