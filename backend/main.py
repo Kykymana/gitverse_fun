@@ -6,7 +6,7 @@ import paramiko
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, HttpUrl
 from typing import List, Dict, Optional, Tuple
 import subprocess
 import os
@@ -41,18 +41,40 @@ class CommitInfo(BaseModel):
 class DeployRequest(BaseModel):
     commit_hash: str
 
+class RepositoryConfig(BaseModel):
+    name: str
+    git_url: str
+    branch: str = "main"
+    server: dict
+    repo_ssh_key: Optional[str] = None
+    current_deployed_commit: Optional[str] = None
+    previous_deployed_commit: Optional[str] = None
+    
+def save_config():
+    """Сохранение текущей конфигурации в JSON файл."""
+    global _config
+    try:
+        with open("config.json", "w") as f:
+            json.dump(_config, f, indent=4)
+        logger.info("Конфигурация успешно сохранена в config.json.")
+    except Exception as e:
+        logger.error(f"Ошибка при сохранении config.json: {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка при сохранении конфигурации: {e}")
+
 def load_config_on_startup():
     """Загрузка конфигурации из JSON файла при старте приложения."""
     global _config
     try:
-        with open("config.json", "r") as f:
-            _config = json.load(f)
-        logger.info("Конфигурация успешно загружена.")
+        if os.path.exists("config.json"):
+            with open("config.json", "r") as f:
+                _config = json.load(f)
+            logger.info("Конфигурация успешно загружена.")
+        else:
+            logger.warning("Файл config.json не найден. Будет создан пустой конфигурационный файл.")
+            _config = {"repositories": []}
+            save_config()
         if not _config.get("repositories"):
             logger.warning("В config.json отсутствует или пуста секция 'repositories'.")
-    except FileNotFoundError:
-        logger.error("Ошибка: config.json не найден. Убедитесь, что он расположен в корневой директории приложения (backend/).")
-        _config = {"repositories": []}
     except json.JSONDecodeError as e:
         logger.error(f"Ошибка: Неверный формат JSON в config.json: {e}. Проверьте синтаксис файла.")
         _config = {"repositories": []}
@@ -99,12 +121,10 @@ def _get_docker_ps_raw(ssh_client: paramiko.SSHClient, repo_name: str) -> str:
     """
     Получает отформатированный вывод `docker ps` для репозитория.
     """
-    # Используем --format "table..." для вывода таблицы с заголовком и нужными полями.
-    # --filter используется для выбора контейнеров, связанных с репозиторием.
     command = "docker ps --format 'table {{.Image}}\t{{.Status}}\t{{.Ports}}'"
+
     stdin, stdout, stderr = ssh_client.exec_command(command)
     
-    # Читаем весь вывод
     output = stdout.read().decode()
     error_output = stderr.read().decode()
     
@@ -117,12 +137,11 @@ def _get_docker_ps_raw(ssh_client: paramiko.SSHClient, repo_name: str) -> str:
         logger.error(f"Команда 'docker ps' завершилась с ошибкой. Вывод: {error_output}")
         return f"Ошибка при получении статуса Docker: {error_output}"
 
-    # Если вывода больше одной строки (заголовок + данные), значит, контейнеры найдены.
     if len(output.strip().splitlines()) > 1:
         return output
     else:
-        # Если вывода нет или только заголовок, значит, контейнеры не найдены.
         return "Нет запущенных контейнеров Docker, связанных с этим репозиторием."
+
 def get_commits_from_git_repo(repo_url: str, branch: str = "main", ssh_key_path: Optional[str] = None) -> List[CommitInfo]:
     """
     Клонирует репозиторий в временную директорию и получает последние 10 коммитов
@@ -188,6 +207,8 @@ async def get_repositories():
         git_url = repo_config["git_url"]
         branch = repo_config.get("branch", "main")
         repo_ssh_key = repo_config.get("repo_ssh_key")
+        current_deployed_commit = repo_config.get("current_deployed_commit")
+        previous_deployed_commit = repo_config.get("previous_deployed_commit")
         
         commits = get_commits_from_git_repo(git_url, branch, repo_ssh_key)
         
@@ -200,41 +221,72 @@ async def get_repositories():
                 "user": repo_config["server"]["user"],
                 "deploy_path": repo_config["server"]["deploy_path"]
             },
-            "commits": [commit.model_dump() for commit in commits]
+            "repo_ssh_key": repo_ssh_key,
+            "commits": [commit.model_dump() for commit in commits],
+            "current_deployed_commit": current_deployed_commit,
+            "previous_deployed_commit": previous_deployed_commit
         })
     logger.info(f"Сформирован список из {len(repo_list)} репозиториев для фронтенда.")
     return repo_list
+    
+@app.post("/repos")
+async def add_repo(repo_config: RepositoryConfig):
+    """Добавляет новый репозиторий в конфигурацию."""
+    global _config
+    if any(r["name"] == repo_config.name for r in _config.get("repositories", [])):
+        raise HTTPException(status_code=400, detail="Репозиторий с таким именем уже существует.")
+    
+    _config["repositories"].append(repo_config.model_dump())
+    save_config()
+    return {"status": "success", "message": f"Репозиторий '{repo_config.name}' успешно добавлен."}
 
-@app.post("/deploy/{repo_name}")
-async def deploy_repo(repo_name: str, request: DeployRequest):
-    """
-    Деплоит выбранный коммит на удаленный сервер: клонирует/обновляет репозиторий,
-    переключается на коммит, собирает и запускает docker-compose.
-    """
-    logger.info(f"Получен запрос на деплой '{repo_name}' на коммит '{request.commit_hash}'.")
-    repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
-    if not repo:
-        logger.error(f"Репозиторий '{repo_name}' не найден в конфигурации.")
-        raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
+@app.put("/repos/{repo_name}")
+async def update_repo(repo_name: str, updated_repo_config: RepositoryConfig):
+    """Обновляет существующий репозиторий в конфигурации."""
+    global _config
+    repo_found = False
+    for i, repo in enumerate(_config.get("repositories", [])):
+        if repo["name"] == repo_name:
+            _config["repositories"][i] = updated_repo_config.model_dump()
+            repo_found = True
+            break
+            
+    if not repo_found:
+        raise HTTPException(status_code=404, detail="Репозиторий не найден.")
+    
+    save_config()
+    return {"status": "success", "message": f"Репозиторий '{repo_name}' успешно обновлен."}
 
+@app.delete("/repos/{repo_name}")
+async def delete_repo(repo_name: str):
+    """Удаляет репозиторий из конфигурации."""
+    global _config
+    initial_count = len(_config.get("repositories", []))
+    _config["repositories"] = [r for r in _config["repositories"] if r["name"] != repo_name]
+    
+    if len(_config["repositories"]) == initial_count:
+        raise HTTPException(status_code=404, detail="Репозиторий не найден.")
+        
+    save_config()
+    return {"status": "success", "message": f"Репозиторий '{repo_name}' успешно удален."}
+    
+def _perform_deploy_action(repo: Dict, commit_hash: str, action_name: str, output_log: List[str]):
+    """
+    Вспомогательная функция для выполнения команд деплоя.
+    """
     server_ip = repo["server"]["ip"]
     server_user = repo["server"]["user"]
     ssh_key_path = repo["server"]["ssh_key"]
     deploy_path = repo["server"]["deploy_path"]
-    commit_hash = request.commit_hash
     git_url = repo["git_url"]
     repo_ssh_key = repo["repo_ssh_key"]
     
-    if not all([server_ip, server_user, ssh_key_path, deploy_path, commit_hash]):
-        logger.error(f"Недостающие данные конфигурации для деплоя репозитория '{repo_name}'.")
-        raise HTTPException(status_code=500, detail="Недостающие данные конфигурации для сервера или коммита")
-
     ssh = None
     sftp = None
     remote_repo_key_path = None
-    output_log = []
+    
     try:
-        logger.info(f"Подключение к {server_user}@{server_ip} с ключом {ssh_key_path}...")
+        logger.info(f"[{action_name}] Подключение к {server_user}@{server_ip} с ключом {ssh_key_path}...")
         ssh = paramiko.SSHClient()
         ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         ssh.connect(
@@ -243,8 +295,8 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
             key_filename=ssh_key_path,
             timeout=30
         )
-        output_log.append(f"Успешно подключено к {server_ip}")
-        logger.info(f"Подключение к {server_ip} установлено.")
+        output_log.append(f"[{action_name}] Успешно подключено к {server_ip}")
+        logger.info(f"[{action_name}] Подключение к {server_ip} установлено.")
         
         if repo_ssh_key:
             sftp = paramiko.SFTPClient.from_transport(ssh.get_transport())
@@ -252,7 +304,7 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
             remote_repo_key_path = f"/tmp/{key_filename}"
             sftp.put(repo_ssh_key, remote_repo_key_path)
             _execute_remote_command(ssh, f"chmod 600 {remote_repo_key_path}", "Ошибка установки прав на SSH-ключ", output_log)
-            logger.info(f"Ключ репозитория успешно скопирован в {remote_repo_key_path} на удаленном сервере.")
+            logger.info(f"[{action_name}] Ключ репозитория успешно скопирован в {remote_repo_key_path} на удаленном сервере.")
         
         ssh_port_match = re.search(r':(\d+)/', git_url)
         port_option = f"-p {ssh_port_match.group(1)}" if ssh_port_match else ""
@@ -260,22 +312,22 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
         git_ssh_command_str = f"export GIT_SSH_COMMAND=\"ssh -i {remote_repo_key_path} -o StrictHostKeyChecking=no {port_option}\"" if remote_repo_key_path else ""
         
         _execute_remote_command(ssh, f"mkdir -p {deploy_path}", "Ошибка при создании директории", output_log, prepend_commands=git_ssh_command_str)
-        output_log.append(f"Директория {deploy_path} проверена/создана.")
+        output_log.append(f"[{action_name}] Директория {deploy_path} проверена/создана.")
 
         repo_status_cmd = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
         repo_status_out, _ = _execute_remote_command(ssh, repo_status_cmd, "Ошибка проверки статуса репозитория", output_log, prepend_commands=git_ssh_command_str)
         repo_status = repo_status_out.strip()
-        logger.info(f"Статус репозитория в {deploy_path} на {server_ip}: {repo_status}")
+        logger.info(f"[{action_name}] Статус репозитория в {deploy_path} на {server_ip}: {repo_status}")
 
         if repo_status == "not_exists":
             _execute_remote_command(ssh, f"cd {deploy_path} && git clone {git_url} .", "Ошибка клонирования", output_log, prepend_commands=git_ssh_command_str)
-            output_log.append(f"Клонирование репозитория {git_url} завершено.")
+            output_log.append(f"[{action_name}] Клонирование репозитория {git_url} завершено.")
         else:
             _execute_remote_command(ssh, f"cd {deploy_path} && git fetch --all --prune", "Ошибка обновления репозитория", output_log, prepend_commands=git_ssh_command_str)
-            output_log.append("Обновление репозитория завершено.")
+            output_log.append(f"[{action_name}] Обновление репозитория завершено.")
         
         _execute_remote_command(ssh, f"cd {deploy_path} && git checkout -f {commit_hash}", "Ошибка переключения на коммит", output_log, prepend_commands=git_ssh_command_str)
-        output_log.append(f"Переключение на коммит {commit_hash} завершено.")
+        output_log.append(f"[{action_name}] Переключение на коммит {commit_hash} завершено.")
 
         docker_commands = [
             f"cd {deploy_path}",
@@ -284,37 +336,86 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
             f"docker-compose up -d"
         ]
         _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose", output_log)
-        output_log.append("Docker Compose действия (down, build, up -d) завершены.")
+        output_log.append(f"[{action_name}] Docker Compose действия (down, build, up -d) завершены.")
 
-        logger.info(f"Деплой '{repo_name}' на коммит '{commit_hash}' успешно завершен.")
-        return {"status": "success", "output": "\n".join(output_log)}
-
+        logger.info(f"[{action_name}] {action_name} '{repo['name']}' на коммит '{commit_hash}' успешно завершен.")
+        
+        # Обновляем коммиты в конфиге
+        for r in _config.get("repositories", []):
+            if r["name"] == repo["name"]:
+                if action_name == "Откат":
+                    current = r.get("current_deployed_commit")
+                    previous = r.get("previous_deployed_commit")
+                    r["current_deployed_commit"] = previous
+                    r["previous_deployed_commit"] = current
+                else: # Deploy
+                    r["previous_deployed_commit"] = r.get("current_deployed_commit")
+                    r["current_deployed_commit"] = commit_hash
+                break
+        save_config()
+        
     except paramiko.AuthenticationException as e:
-        logger.error(f"Ошибка аутентификации при подключении к {server_ip}: {e}")
+        logger.error(f"[{action_name}] Ошибка аутентификации при подключении к {server_ip}: {e}")
         raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: Проверьте SSH-ключ и права доступа. {e}")
     except paramiko.SSHException as e:
-        logger.error(f"Ошибка SSH при подключении/выполнении команд на {server_ip}: {e}")
+        logger.error(f"[{action_name}] Ошибка SSH при подключении/выполнении команд на {server_ip}: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка SSH: Не удалось подключиться или выполнить команды. {e}")
     except Exception as e:
-        logger.error(f"Неизвестная ошибка деплоя для '{repo_name}': {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка деплоя: {e}")
+        logger.error(f"[{action_name}] Неизвестная ошибка {action_name} для '{repo['name']}': {e}")
+        raise HTTPException(status_code=500, detail=f"Ошибка {action_name}: {e}")
     finally:
         if ssh:
             if sftp and remote_repo_key_path:
                 try:
                     sftp.remove(remote_repo_key_path)
-                    logger.info(f"Временный ключ {remote_repo_key_path} успешно удален с сервера.")
+                    logger.info(f"[{action_name}] Временный ключ {remote_repo_key_path} успешно удален с сервера.")
                 except Exception as e:
-                    logger.warning(f"Не удалось удалить временный ключ с сервера: {e}")
+                    logger.warning(f"[{action_name}] Не удалось удалить временный ключ с сервера: {e}")
                 finally:
                     sftp.close()
             ssh.close()
-            logger.info(f"SSH-соединение с {server_ip} закрыто.")
+            logger.info(f"[{action_name}] SSH-соединение с {server_ip} закрыто.")
+
+@app.post("/deploy/{repo_name}")
+async def deploy_repo(repo_name: str, request: DeployRequest):
+    """
+    Деплоит выбранный коммит на удаленный сервер.
+    """
+    logger.info(f"Получен запрос на деплой '{repo_name}' на коммит '{request.commit_hash}'.")
+    repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
+    
+    # Check if the requested commit is the same as the current one.
+    if repo.get("current_deployed_commit") == request.commit_hash:
+        raise HTTPException(status_code=400, detail="Эта версия уже развернута. Если вы хотите перезапустить, используйте кнопку 'Запустить'.")
+
+    output_log = []
+    _perform_deploy_action(repo, request.commit_hash, "Деплой", output_log)
+    return {"status": "success", "output": "\n".join(output_log)}
+
+@app.post("/rollback/{repo_name}")
+async def rollback_repo(repo_name: str):
+    """
+    Откатывает сервис до последней успешно запущенной версии.
+    """
+    logger.info(f"Получен запрос на откат для '{repo_name}'.")
+    repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
+    if not repo:
+        raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
+    
+    commit_hash_to_rollback = repo.get("previous_deployed_commit")
+    if not commit_hash_to_rollback:
+        raise HTTPException(status_code=400, detail="Нет предыдущей версии для отката.")
+    
+    output_log = []
+    _perform_deploy_action(repo, commit_hash_to_rollback, "Откат", output_log)
+    return {"status": "success", "output": "\n".join(output_log)}
 
 @app.get("/status/{repo_name}")
 async def get_repo_status(repo_name: str):
     """
-    Получает необработанный вывод `docker ps` для указанного репозитория.
+    Получает отформатированный вывод `docker ps` для указанного репозитория.
     """
     logger.info(f"Получен запрос на получение статуса для '{repo_name}'.")
     repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
@@ -339,7 +440,6 @@ async def get_repo_status(repo_name: str):
         )
         logger.info(f"Подключение к {server_ip} установлено.")
 
-        # Проверяем, существует ли репозиторий на сервере
         repo_status_cmd = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
         stdin, stdout, stderr = ssh.exec_command(repo_status_cmd)
         repo_exists = stdout.read().decode().strip() == "exists"
@@ -347,7 +447,6 @@ async def get_repo_status(repo_name: str):
         if not repo_exists:
             return {"status": "not_deployed", "output": "Сервис еще не установлен на сервере."}
 
-        # Получаем необработанный вывод docker ps
         raw_docker_output = _get_docker_ps_raw(ssh, repo_name)
         
         return {"status": "deployed", "output": raw_docker_output}

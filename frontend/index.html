@@ -33,6 +33,17 @@
             font-size: 2.2em;
             font-weight: 600;
         }
+        .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        .section-header h2 {
+            margin: 0;
+            font-size: 1.8em;
+            color: #34495e;
+        }
         .repo-card {
             background-color: #fdfdfd;
             border: 1px solid #e0e0e0;
@@ -108,6 +119,13 @@
         .actions button.deploy:hover {
             background-color: #27ae60;
         }
+        .actions button.rollback {
+            background-color: #f39c12;
+            color: white;
+        }
+        .actions button.rollback:hover {
+            background-color: #e67e22;
+        }
         .actions button.run {
             background-color: #3498db;
             color: white;
@@ -121,6 +139,20 @@
         }
         .actions button.stop:hover {
             background-color: #c0392b;
+        }
+        .actions button.edit, .actions button.delete {
+            background-color: #95a5a6;
+            color: white;
+        }
+        .actions button.edit:hover {
+            background-color: #7f8c8d;
+        }
+        .actions button.delete:hover {
+            background-color: #7f8c8d;
+        }
+        .actions button:disabled {
+            background-color: #ccc;
+            cursor: not-allowed;
         }
         .log {
             background-color: #f0f0f0;
@@ -202,7 +234,82 @@
             font-size: 0.8em;
             color: #333;
         }
-        
+
+        .add-form-container {
+            background-color: #e9ecef;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 25px;
+            transition: all 0.3s ease-in-out;
+            max-height: 0;
+            overflow: hidden;
+        }
+        .add-form-container.active {
+            max-height: 1000px; /* Adjust as needed */
+            padding: 20px;
+            margin-bottom: 25px;
+        }
+
+        .form-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            margin-bottom: 15px;
+        }
+        .form-group {
+            flex: 1 1 45%;
+            display: flex;
+            flex-direction: column;
+        }
+        .form-group label {
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .form-group input, .form-group textarea {
+            padding: 10px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            font-size: 1em;
+            width: 100%;
+        }
+        .form-buttons {
+            display: flex;
+            gap: 10px;
+            justify-content: flex-end;
+            margin-top: 20px;
+        }
+        .form-buttons button, .add-button {
+            padding: 12px 25px;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 1em;
+            font-weight: 600;
+            transition: background-color 0.3s ease, transform 0.1s ease;
+            box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+        }
+        .add-button {
+            background-color: #27ae60;
+            color: white;
+        }
+        .add-button:hover {
+            background-color: #2ecc71;
+        }
+        .form-buttons button.save {
+            background-color: #3498db;
+            color: white;
+        }
+        .form-buttons button.save:hover {
+            background-color: #2980b9;
+        }
+        .form-buttons button.cancel {
+            background-color: #95a5a6;
+            color: white;
+        }
+        .form-buttons button.cancel:hover {
+            background-color: #7f8c8d;
+        }
+
         @media (max-width: 768px) {
             .container {
                 padding: 20px;
@@ -219,12 +326,76 @@
                 width: 100%;
                 min-width: unset;
             }
+            .form-row {
+                flex-direction: column;
+                gap: 15px;
+            }
         }
     </style>
 </head>
 <body>
     <div id="app" class="container">
         <h1>Менеджер Микросервисов</h1>
+
+        <div class="section-header">
+            <h2>Добавить / Редактировать сервис</h2>
+            <button class="add-button" @click="toggleAddForm">{{ showAddForm ? 'Скрыть' : 'Добавить новый' }}</button>
+        </div>
+
+        <div :class="['add-form-container', { 'active': showAddForm }]">
+            <form @submit.prevent="addOrUpdateRepo">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="name">Имя сервиса (имя папки на сервере):</label>
+                        <input id="name" v-model="newRepo.name" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="git_url">URL Git-репозитория:</label>
+                        <input id="git_url" v-model="newRepo.git_url" required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="branch">Ветка:</label>
+                        <input id="branch" v-model="newRepo.branch" placeholder="main" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="server_ip">IP сервера:</label>
+                        <input id="server_ip" v-model="newRepo.server.ip" required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="server_user">Пользователь сервера:</label>
+                        <input id="server_user" v-model="newRepo.server.user" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="deploy_path">Путь деплоя:</label>
+                        <input id="deploy_path" v-model="newRepo.server.deploy_path" required>
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="server_ssh_key">Путь к SSH-ключу сервера (абсолютный):</label>
+                        <input id="server_ssh_key" v-model="newRepo.server.ssh_key" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="repo_ssh_key">Путь к SSH-ключу репозитория (абсолютный, опционально):</label>
+                        <input id="repo_ssh_key" v-model="newRepo.repo_ssh_key">
+                    </div>
+                </div>
+                <div class="form-buttons">
+                    <button type="button" class="cancel" @click="cancelEdit">Отмена</button>
+                    <button type="submit" class="save">{{ isEditMode ? 'Сохранить изменения' : 'Добавить сервис' }}</button>
+                </div>
+            </form>
+        </div>
+
+        <hr>
+
+        <div class="section-header">
+            <h2>Список сервисов</h2>
+        </div>
         <div v-if="loading" class="status-message loading">
             Загрузка репозиториев...
         </div>
@@ -240,18 +411,23 @@
                 <p><strong>Ветка:</strong> {{ repo.branch }}</p>
                 <p><strong>IP сервера:</strong> {{ repo.server_info.ip }}</p>
                 <p><strong>Путь деплоя:</strong> {{ repo.server_info.deploy_path }}</p>
+                <p v-if="repo.current_deployed_commit"><strong>Текущая версия:</strong> {{ getCommitMessage(repo.commits, repo.current_deployed_commit) }} ({{ repo.current_deployed_commit.substring(0, 7) }})</p>
+                <p v-if="repo.previous_deployed_commit"><strong>Предыдущая версия:</strong> {{ getCommitMessage(repo.commits, repo.previous_deployed_commit) }} ({{ repo.previous_deployed_commit.substring(0, 7) }})</p>
                 
                 <div class="actions">
-                    <label :for="'commit-select-' + repo.name">Версия:</label>
+                    <label :for="'commit-select-' + repo.name">Версия для установки:</label>
                     <select :id="'commit-select-' + repo.name" v-model="repo.selectedCommitHash">
                         <option v-if="repo.commits.length === 0" value="" disabled>Коммиты не найдены</option>
-                        <option v-for="commit in repo.commits" :value="commit.hash">
+                        <option v-for="commit in repo.commits" :value="commit.hash" :disabled="commit.hash === repo.current_deployed_commit">
                             {{ commit.message }} ({{ commit.hash.substring(0, 7) }})
                         </option>
                     </select>
-                    <button class="deploy" @click="deployCommit(repo)">Установить</button>
+                    <button class="deploy" @click="deployCommit(repo)" :disabled="!repo.selectedCommitHash || repo.selectedCommitHash === repo.current_deployed_commit">Установить</button>
+                    <button class="rollback" @click="rollbackRepo(repo)" :disabled="!repo.previous_deployed_commit">Откат</button>
                     <button class="run" @click="runMicroservice(repo)">Запустить</button>
                     <button class="stop" @click="stopMicroservice(repo)">Остановить</button>
+                    <button class="edit" @click="editRepo(repo)">Редактировать</button>
+                    <button class="delete" @click="deleteRepo(repo)">Удалить</button>
                 </div>
 
                 <div v-if="repo.dockerStatus" class="docker-status-section">
@@ -283,7 +459,22 @@
                 return {
                     repos: [],
                     loading: true,
-                    error: null
+                    error: null,
+                    showAddForm: false,
+                    isEditMode: false,
+                    originalRepoName: '',
+                    newRepo: {
+                        name: '',
+                        git_url: '',
+                        branch: 'main',
+                        server: {
+                            ip: '',
+                            user: '',
+                            deploy_path: '',
+                            ssh_key: ''
+                        },
+                        repo_ssh_key: ''
+                    }
                 };
             },
             mounted() {
@@ -305,6 +496,8 @@
                                 return {
                                     ...existingRepo,
                                     commits: newRepo.commits,
+                                    current_deployed_commit: newRepo.current_deployed_commit,
+                                    previous_deployed_commit: newRepo.previous_deployed_commit
                                 };
                             } else {
                                 return {
@@ -341,14 +534,12 @@
                     }
                 },
                 startPolling() {
-                    // Первоначальная загрузка
                     this.fetchRepos().then(() => {
                         this.repos.forEach(repo => {
                             this.fetchStatusForRepo(repo);
                         });
                     });
 
-                    // Периодическое обновление
                     setInterval(() => {
                         this.fetchRepos().then(() => {
                             this.repos.forEach(repo => {
@@ -378,7 +569,7 @@
                             repo.statusType = "success";
                             repo.statusMessage = `${actionName} успешно завершен для ${repo.name}.`;
                         } else {
-                            repo.logMessage = result.details || `${actionName} не удался.`;
+                            repo.logMessage = result.detail || `${actionName} не удался.`;
                             repo.statusType = "error";
                             repo.statusMessage = `${actionName} не удался для ${repo.name}: ${result.detail || 'Неизвестная ошибка'}`;
                         }
@@ -388,7 +579,7 @@
                         repo.statusType = "error";
                         repo.statusMessage = `${actionName} не удался для ${repo.name}: ${err.message}`;
                     } finally {
-                         // После выполнения действия, принудительно обновляем статус
+                        await this.fetchRepos();
                         this.fetchStatusForRepo(repo);
                     }
                 },
@@ -400,11 +591,99 @@
                     }
                     await this.executeAction(repo, 'deploy', 'Установка версии', { commit_hash: repo.selectedCommitHash });
                 },
+                async rollbackRepo(repo) {
+                    await this.executeAction(repo, 'rollback', 'Откат версии');
+                },
                 async runMicroservice(repo) {
                     await this.executeAction(repo, 'run', 'Запуск микросервиса');
                 },
                 async stopMicroservice(repo) {
                     await this.executeAction(repo, 'stop', 'Остановка микросервиса');
+                },
+                toggleAddForm() {
+                    this.showAddForm = !this.showAddForm;
+                    if (!this.showAddForm) {
+                        this.resetForm();
+                    }
+                },
+                editRepo(repo) {
+                    this.showAddForm = true;
+                    this.isEditMode = true;
+                    this.originalRepoName = repo.name;
+                    this.newRepo = {
+                        name: repo.name,
+                        git_url: repo.git_url,
+                        branch: repo.branch,
+                        server: { ...repo.server_info },
+                        repo_ssh_key: repo.repo_ssh_key
+                    };
+                },
+                cancelEdit() {
+                    this.showAddForm = false;
+                    this.resetForm();
+                },
+                resetForm() {
+                    this.isEditMode = false;
+                    this.originalRepoName = '';
+                    this.newRepo = {
+                        name: '',
+                        git_url: '',
+                        branch: 'main',
+                        server: { ip: '', user: '', deploy_path: '', ssh_key: '' },
+                        repo_ssh_key: ''
+                    };
+                },
+                async addOrUpdateRepo() {
+                    try {
+                        let response;
+                        if (this.isEditMode) {
+                            response = await fetch(`${API_BASE_URL}/repos/${this.originalRepoName}`, {
+                                method: 'PUT',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(this.newRepo)
+                            });
+                        } else {
+                            response = await fetch(`${API_BASE_URL}/repos`, {
+                                method: 'POST',
+                                headers: { 'Content-Type': 'application/json' },
+                                body: JSON.stringify(this.newRepo)
+                            });
+                        }
+                        
+                        const result = await response.json();
+                        if (response.ok) {
+                            alert(result.message);
+                            window.location.reload();
+                        } else {
+                            alert(`Ошибка: ${result.detail}`);
+                        }
+                    } catch (err) {
+                        console.error('Ошибка при сохранении репозитория:', err);
+                        alert('Сетевая ошибка при сохранении репозитория.');
+                    }
+                },
+                async deleteRepo(repo) {
+                    if (confirm(`Вы уверены, что хотите удалить репозиторий "${repo.name}"?`)) {
+                        try {
+                            const response = await fetch(`${API_BASE_URL}/repos/${repo.name}`, {
+                                method: 'DELETE'
+                            });
+                            const result = await response.json();
+                            if (response.ok) {
+                                alert(result.message);
+                                window.location.reload();
+                            } else {
+                                alert(`Ошибка: ${result.detail}`);
+                            }
+                        } catch (err) {
+                            console.error('Ошибка при удалении репозитория:', err);
+                            alert('Сетевая ошибка при удалении репозитория.');
+                        }
+                    }
+                },
+                getCommitMessage(commits, hash) {
+                    const commit = commits.find(c => c.hash === hash);
+                    return commit ? commit.message : 'Неизвестная версия';
                 }
             }
         });
