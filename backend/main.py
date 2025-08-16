@@ -50,7 +50,7 @@ class ServerConfig(BaseModel):
     ip: str
     user: str
     deploy_path: str
-    ssh_key: Optional[str] = None # Теперь ключ в этой модели
+    ssh_key: Optional[str] = None
 
 class RepositoryConfig(BaseModel):
     name: str
@@ -58,9 +58,9 @@ class RepositoryConfig(BaseModel):
     branch: str = "main"
     server: ServerConfig
     repo_ssh_key: Optional[str] = None
-    docker_compose_file: str = "docker-compose.yml" # Добавлено
-    current_deployed_commit: Optional[str] = None # Добавлено
-    previous_deployed_commit: Optional[str] = None # Добавлено
+    docker_compose_file: str = "docker-compose.yml"
+    current_deployed_commit: Optional[str] = None
+    previous_deployed_commit: Optional[str] = None
 
 def save_config():
     """Сохранение текущей конфигурации в JSON файл."""
@@ -359,11 +359,10 @@ def _perform_deploy_action(repo: Dict, commit_hash: str, action_name: str, outpu
         _execute_remote_command(ssh, f"cd {deploy_path} && git checkout -f {commit_hash}", "Ошибка переключения на коммит", output_log, prepend_commands=git_ssh_command_str)
         output_log.append(f"[{action_name}] Переключение на коммит {commit_hash} завершено.")
 
+        # Обновленные команды docker-compose
         docker_commands = [
             f"cd {deploy_path}",
-            f"docker-compose down",
-            f"docker-compose build",
-            f"docker-compose up -d"
+            f"docker-compose down --rmi all --volumes && docker-compose up -d --build"
         ]
         _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose", output_log)
         output_log.append(f"[{action_name}] Docker Compose действия (down, build, up -d) завершены.")

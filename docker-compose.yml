@@ -6,7 +6,6 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - /path/to/your/ssh/key/id_rsa:/app/ssh_keys/id_rsa_deploy:ro
       - ./config.json:/app/config.json
     environment:
       - CONFIG_PATH=/app/config.json
