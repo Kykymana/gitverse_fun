@@ -2,6 +2,7 @@
 FROM python:3.9-slim-bullseye
 
 WORKDIR /app
+RUN apt update && apt install -y wireguard iproute2 iputils-ping net-tools
 
 # Установка git, чтобы команды git log/clone работали
 RUN apt-get update && apt-get install -y git \

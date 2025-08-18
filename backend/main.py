@@ -19,15 +19,18 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
-origins = [
-    "http://localhost:8888",
-    "http://127.0.0.1:8888",
-    "http://109.73.195.124:8888",
-]
+# origins = [
+#     "http://localhost:8888",
+#     "http://127.0.0.1:8888",
+#     "http://109.73.195.124:8888",
+#     "http://10.8.0.19:80",
+#     "http://10.8.0.19:8000",
+#     "http://10.8.0.19:8888",
+# ]
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

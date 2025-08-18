@@ -1,28 +1,39 @@
 version: '3.8'
 
 services:
+  vpn_client:
+    image: linuxserver/wireguard
+    container_name: wireguard_client
+    cap_add:
+      - NET_ADMIN
+    volumes:
+      - ./wireguard:/config
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    ports:
+      - "8888:80"
+      - "8000:8000"
+    restart: unless-stopped
+  
   backend:
     build: ./backend
-    ports:
-      - "8000:8000"
+    container_name: backend
     volumes:
       - ./config.json:/app/config.json
     environment:
       - CONFIG_PATH=/app/config.json
-    networks:
-      - app_network
+    network_mode: "service:vpn_client"
+    depends_on:
+      - vpn_client
     restart: unless-stopped
 
   frontend:
     build: ./frontend
-    ports:
-      - "8888:80"
+    container_name: frontend
+    environment:
+      - PORT=8888
     depends_on:
       - backend
-    networks:
-      - app_network
+      - vpn_client
+    network_mode: "service:vpn_client"
     restart: unless-stopped
-
-networks:
-  app_network:
-    driver: bridge

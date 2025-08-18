@@ -441,7 +441,8 @@
     </div>
 
     <script>
-        const API_BASE_URL = "http://localhost:8000"; 
+        const BACKEND_PORT = 8000;
+        const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:${BACKEND_PORT}`;
         const REFRESH_INTERVAL = 5000; // 5 секунд
 
         const app = Vue.createApp({
