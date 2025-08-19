@@ -14,7 +14,8 @@ services:
       - "8888:80"
       - "8000:8000"
     restart: unless-stopped
-  
+    command: sh -c "ping -c 5 10.8.0.1 && tail -f /dev/null"
+
   backend:
     build: ./backend
     container_name: backend
