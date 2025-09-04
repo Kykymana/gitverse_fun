@@ -331,6 +331,64 @@
                 gap: 15px;
             }
         }
+        /* Modal styles */
+        .modal {
+            position: fixed;
+            z-index: 1000;
+            left: 0;
+            top: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.5);
+            display: flex;
+            justify-content: center;
+            align-items: center;
+        }
+        .modal-content {
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 12px;
+            width: 90%;
+            max-width: 450px;
+            box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+            text-align: center;
+        }
+        .modal-content h3 {
+            margin-top: 0;
+            color: #2c3e50;
+        }
+        .modal-content p {
+            margin-bottom: 25px;
+            font-size: 1em;
+            line-height: 1.5;
+        }
+        .modal-buttons {
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+        }
+        .modal-buttons button {
+            padding: 10px 20px;
+            border-radius: 8px;
+            border: none;
+            cursor: pointer;
+            font-weight: bold;
+            transition: background-color 0.3s ease;
+        }
+        .modal-buttons .confirm-ok {
+            background-color: #3498db;
+            color: white;
+        }
+        .modal-buttons .confirm-ok:hover {
+            background-color: #2980b9;
+        }
+        .modal-buttons .confirm-cancel {
+            background-color: #bdc3c7;
+            color: #333;
+        }
+        .modal-buttons .confirm-cancel:hover {
+            background-color: #95a5a6;
+        }
     </style>
 </head>
 <body>
@@ -440,10 +498,23 @@
             </div>
         </div>
     </div>
+    
+    <!-- Custom Modal -->
+    <div class="modal" v-if="showModal">
+        <div class="modal-content">
+            <h3>{{ modalTitle }}</h3>
+            <p>{{ modalMessage }}</p>
+            <div class="modal-buttons">
+                <button class="confirm-ok" @click="handleConfirm(true)">ОК</button>
+                <button v-if="isConfirmModal" class="confirm-cancel" @click="handleConfirm(false)">Отмена</button>
+            </div>
+        </div>
+    </div>
 
     <script>
-        const BACKEND_PORT = 8000;
-        const API_BASE_URL = `${window.location.protocol}//localhost:${BACKEND_PORT}`;
+        // Использование имени сервиса Docker для обращения к бэкенду
+        // Это работает, потому что оба сервиса находятся в одной сети.
+        const API_BASE_URL = 'http://backend:8000';
 
         const app = Vue.createApp({
             data() {
@@ -465,13 +536,39 @@
                             ssh_key: ''
                         },
                         repo_ssh_key: ''
-                    }
+                    },
+                    showModal: false,
+                    modalTitle: '',
+                    modalMessage: '',
+                    isConfirmModal: false,
+                    confirmCallback: null
                 };
             },
             mounted() {
                 this.refreshAllData();
             },
             methods: {
+                // Custom modal logic
+                showAlert(title, message) {
+                    this.showModal = true;
+                    this.modalTitle = title;
+                    this.modalMessage = message;
+                    this.isConfirmModal = false;
+                },
+                showConfirm(title, message, callback) {
+                    this.showModal = true;
+                    this.modalTitle = title;
+                    this.modalMessage = message;
+                    this.isConfirmModal = true;
+                    this.confirmCallback = callback;
+                },
+                handleConfirm(result) {
+                    this.showModal = false;
+                    if (this.confirmCallback && result) {
+                        this.confirmCallback();
+                    }
+                    this.confirmCallback = null;
+                },
                 async fetchRepos() {
                     try {
                         const response = await fetch(`${API_BASE_URL}/repos`);
@@ -566,7 +663,7 @@
                 },
                 async deployCommit(repo) {
                     if (!repo.selectedCommitHash) {
-                        repo.statusMessage = "Пожалуйста, выберите коммит для установки.";
+                        this.showAlert("Ошибка", "Пожалуйста, выберите коммит для установки.");
                         repo.statusType = "error";
                         return;
                     }
@@ -634,35 +731,35 @@
                         
                         const result = await response.json();
                         if (response.ok) {
-                            alert(result.message);
+                            this.showAlert("Успех", result.message);
                             this.refreshAllData();
                             this.cancelEdit();
                         } else {
-                            alert(`Ошибка: ${result.detail}`);
+                            this.showAlert("Ошибка", `Ошибка: ${result.detail}`);
                         }
                     } catch (err) {
                         console.error('Ошибка при сохранении репозитория:', err);
-                        alert('Сетевая ошибка при сохранении репозитория.');
+                        this.showAlert("Сетевая ошибка", 'Сетевая ошибка при сохранении репозитория.');
                     }
                 },
                 async deleteRepo(repo) {
-                    if (confirm(`Вы уверены, что хотите удалить репозиторий "${repo.name}"?`)) {
+                    this.showConfirm(`Удалить репозиторий?`, `Вы уверены, что хотите удалить репозиторий "${repo.name}"?`, async () => {
                         try {
                             const response = await fetch(`${API_BASE_URL}/repos/${repo.name}`, {
                                 method: 'DELETE'
                             });
                             const result = await response.json();
                             if (response.ok) {
-                                alert(result.message);
+                                this.showAlert("Успех", result.message);
                                 this.refreshAllData();
                             } else {
-                                alert(`Ошибка: ${result.detail}`);
+                                this.showAlert("Ошибка", `Ошибка: ${result.detail}`);
                             }
                         } catch (err) {
                             console.error('Ошибка при удалении репозитория:', err);
-                            alert('Сетевая ошибка при удалении репозитория.');
+                            this.showAlert("Сетевая ошибка", 'Сетевая ошибка при удалении репозитория.');
                         }
-                    }
+                    });
                 },
                 getCommitMessage(commits, hash) {
                     if (!commits || !hash) return 'Неизвестная версия';
@@ -676,3 +773,4 @@
     </script>
 </body>
 </html>
+
