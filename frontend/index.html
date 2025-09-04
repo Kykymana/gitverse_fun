@@ -385,6 +385,7 @@
 
         <div class="section-header">
             <h2>Список сервисов</h2>
+            <button class="run" @click="refreshAllData">Обновить данные</button>
         </div>
         <div v-if="loading" class="status-message loading">
             Загрузка репозиториев...
@@ -443,7 +444,6 @@
     <script>
         const BACKEND_PORT = 8000;
         const API_BASE_URL = `${window.location.protocol}//${window.location.hostname}:${BACKEND_PORT}`;
-        const REFRESH_INTERVAL = 5000; // 5 секунд
 
         const app = Vue.createApp({
             data() {
@@ -469,7 +469,7 @@
                 };
             },
             mounted() {
-                this.startPolling();
+                this.refreshAllData();
             },
             methods: {
                 async fetchRepos() {
@@ -524,20 +524,10 @@
                         repo.dockerStatus = { status: 'error', output: `Сетевая ошибка: ${err.message}` };
                     }
                 },
-                startPolling() {
-                    this.fetchRepos().then(() => {
-                        this.repos.forEach(repo => {
-                            this.fetchStatusForRepo(repo);
-                        });
-                    });
-
-                    setInterval(() => {
-                        this.fetchRepos().then(() => {
-                            this.repos.forEach(repo => {
-                                this.fetchStatusForRepo(repo);
-                            });
-                        });
-                    }, REFRESH_INTERVAL);
+                async refreshAllData() {
+                    this.loading = true;
+                    await this.fetchRepos();
+                    this.repos.forEach(repo => this.fetchStatusForRepo(repo));
                 },
                 async executeAction(repo, endpoint, actionName, payload = {}) {
                     repo.logMessage = `${actionName.toLowerCase()}...`;
@@ -606,7 +596,7 @@
                         git_url: repo.git_url,
                         branch: repo.branch,
                         server: { ...repo.server_info },
-                        repo_ssh_key: repo.repo_ssh_key
+                        ssh_key: repo.server_info.ssh_key
                     };
                 },
                 cancelEdit() {
@@ -621,30 +611,32 @@
                         git_url: '',
                         branch: 'main',
                         server: { ip: '', user: '', deploy_path: '', ssh_key: '' },
-                        repo_ssh_key: ''
+                        ssh_key: ''
                     };
                 },
                 async addOrUpdateRepo() {
                     try {
                         let response;
+                        const dataToSend = { ...this.newRepo, server: { ...this.newRepo.server, ssh_key: this.newRepo.ssh_key } };
                         if (this.isEditMode) {
                             response = await fetch(`${API_BASE_URL}/repos/${this.originalRepoName}`, {
                                 method: 'PUT',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(this.newRepo)
+                                body: JSON.stringify(dataToSend)
                             });
                         } else {
                             response = await fetch(`${API_BASE_URL}/repos`, {
                                 method: 'POST',
                                 headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify(this.newRepo)
+                                body: JSON.stringify(dataToSend)
                             });
                         }
                         
                         const result = await response.json();
                         if (response.ok) {
                             alert(result.message);
-                            window.location.reload();
+                            this.refreshAllData();
+                            this.cancelEdit();
                         } else {
                             alert(`Ошибка: ${result.detail}`);
                         }
@@ -662,7 +654,7 @@
                             const result = await response.json();
                             if (response.ok) {
                                 alert(result.message);
-                                window.location.reload();
+                                this.refreshAllData();
                             } else {
                                 alert(`Ошибка: ${result.detail}`);
                             }
@@ -673,6 +665,7 @@
                     }
                 },
                 getCommitMessage(commits, hash) {
+                    if (!commits || !hash) return 'Неизвестная версия';
                     const commit = commits.find(c => c.hash === hash);
                     return commit ? commit.message : 'Неизвестная версия';
                 }

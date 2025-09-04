@@ -1,17 +1,17 @@
 version: '3.8'
 
 services:
-  vpn_client:
-    image: linuxserver/wireguard
-    container_name: wireguard_client
-    cap_add:
-      - NET_ADMIN
-    volumes:
-      - ./wireguard:/config
-    sysctls:
-      - net.ipv4.conf.all.src_valid_mark=1
-    restart: unless-stopped
-    command: sh -c "ping -c 5 10.8.0.1 && tail -f /dev/null"
+  # vpn_client:
+  #   image: linuxserver/wireguard
+  #   container_name: wireguard_client
+  #   cap_add:
+  #     - NET_ADMIN
+  #   volumes:
+  #     - ./wireguard:/config
+  #   sysctls:
+  #     - net.ipv4.conf.all.src_valid_mark=1
+  #   restart: unless-stopped
+  #   command: sh -c "while true; do ping -c 5 10.8.0.1; sleep 1800; done"
 
   backend:
     build: ./backend
@@ -20,9 +20,6 @@ services:
       - ./config.json:/app/config.json
     environment:
       - CONFIG_PATH=/app/config.json
-    network_mode: "service:vpn_client"
-    depends_on:
-      - vpn_client
     restart: unless-stopped
 
   frontend:
@@ -32,6 +29,4 @@ services:
       - PORT=8888
     depends_on:
       - backend
-      - vpn_client
-    network_mode: "service:vpn_client"
     restart: unless-stopped

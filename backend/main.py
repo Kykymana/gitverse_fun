@@ -1,32 +1,21 @@
 import json
 import logging
 import re
-import requests
-import paramiko
-from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
-from typing import List, Dict, Optional, Tuple
 import subprocess
 import os
-import tempfile
 import shutil
-from io import StringIO
+from contextlib import asynccontextmanager
+from typing import List, Dict, Optional, Tuple
 
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 app = FastAPI()
-
-# origins = [
-#     "http://localhost:8888",
-#     "http://127.0.0.1:8888",
-#     "http://109.73.195.124:8888",
-#     "http://10.8.0.19:80",
-#     "http://10.8.0.19:8000",
-#     "http://10.8.0.19:8888",
-# ]
 
 app.add_middleware(
     CORSMiddleware,
@@ -38,10 +27,8 @@ app.add_middleware(
 
 _config: Dict = {}
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
-
-# Пути к ключам SSH по умолчанию
-DEFAULT_REPO_SSH_KEY_PATH = os.environ.get("REPO_SSH_KEY", "./ssh_keys/repo_key")
-DEFAULT_SERVER_SSH_KEY_PATH = os.environ.get("SERVER_SSH_KEY", "./ssh_keys/server_key")
+LOCAL_REPOS_PATH = os.path.join(os.getcwd(), "local_repos")
+CMD_TIMEOUT = 180
 
 class CommitInfo(BaseModel):
     hash: str
@@ -61,7 +48,6 @@ class RepositoryConfig(BaseModel):
     git_url: str
     branch: str = "main"
     server: ServerConfig
-    repo_ssh_key: Optional[str] = None
     docker_compose_file: str = "docker-compose.yml"
     current_deployed_commit: Optional[str] = None
     previous_deployed_commit: Optional[str] = None
@@ -98,114 +84,90 @@ def load_config_on_startup():
         logger.error(f"Неизвестная ошибка при загрузке {CONFIG_PATH}: {e}")
         _config = {"repositories": []}
 
-@app.on_event("startup")
-async def startup_event():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     load_config_on_startup()
+    yield
 
-def _execute_remote_command(ssh_client: paramiko.SSHClient, command: str, error_message: str, output_log: List[str], prepend_commands: Optional[str] = None) -> Tuple[str, str]:
+app = FastAPI(lifespan=lifespan)
+
+def _run_local_shell_command(command: str, cwd: Optional[str] = None) -> Tuple[str, str]:
     """
-    Выполняет команду на удаленном сервере через SSH и обрабатывает вывод.
-    Возвращает (stdout, stderr). Вызывает исключение при ошибке.
+    Выполняет локальную команду shell и возвращает (stdout, stderr).
     """
-    full_command = f"{prepend_commands} && {command}" if prepend_commands else command
-    logger.info(f"Выполнение команды: {full_command}")
-    stdin, stdout, stderr = ssh_client.exec_command(full_command)
-    out = stdout.read().decode().strip()
-    err = stderr.read().decode().strip()
-    exit_status = stdout.channel.recv_exit_status()
-
-    output_log.append(f"Команда: {full_command}")
-    if out:
-        output_log.append(f"STDOUT:\n{out}")
-    if err:
-        output_log.append(f"STDERR:\n{err}")
-
-    if exit_status != 0:
-        if "already on" in err.lower() or "already at" in err.lower() or "detached head" in err.lower():
-            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {full_command}\n{err}")
-        elif "no such service" in err.lower() or "no such container" in err.lower() or "cannot find" in err.lower():
-            logger.warning(f"Команда завершилась с предупреждением (exit status {exit_status}): {full_command}\n{err}")
-        else:
-            logger.error(f"Команда завершилась с ошибкой (exit status {exit_status}): {full_command}\n{err}")
-            raise Exception(f"{error_message}: {err}")
-    elif err:
-        logger.warning(f"Команда завершилась успешно, но с предупреждениями в STDERR: {full_command}\n{err}")
-
-    return out, err
-
-def _get_docker_ps_raw(ssh_client: paramiko.SSHClient, repo_name: str) -> str:
+    try:
+        logger.info(f"Выполнение локальной команды: {command}")
+        result = subprocess.run(
+            command,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=CMD_TIMEOUT,
+            cwd=cwd
+        )
+        return result.stdout.strip(), result.stderr.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Ошибка локальной команды: {e.cmd}")
+        logger.error(f"STDOUT: {e.stdout}")
+        logger.error(f"STDERR: {e.stderr}")
+        raise HTTPException(status_code=500, detail=f"Ошибка локальной команды: {e.stderr.strip()}")
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Таймаут локальной команды: {e.cmd}")
+        raise HTTPException(status_code=500, detail=f"Таймаут локальной команды: {e.cmd}")
+        
+def _run_remote_shell_command(ssh_command: str) -> Tuple[str, str]:
     """
-    Получает отформатированный вывод `docker ps` для репозитория.
+    Выполняет удаленную команду shell через SSH и возвращает (stdout, stderr).
     """
-    command = "docker ps --format 'table {{.Image}}\t{{.Status}}\t{{.Ports}}'"
+    try:
+        logger.info(f"Выполнение удаленной команды: {ssh_command}")
+        result = subprocess.run(
+            ssh_command,
+            shell=True,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=CMD_TIMEOUT
+        )
+        return result.stdout.strip(), result.stderr.strip()
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Ошибка удаленной команды: {e.cmd}")
+        logger.error(f"STDOUT: {e.stdout}")
+        logger.error(f"STDERR: {e.stderr}")
+        raise HTTPException(status_code=500, detail=f"Ошибка удаленной команды: {e.stderr.strip()}")
+    except subprocess.TimeoutExpired as e:
+        logger.error(f"Таймаут удаленной команды: {e.cmd}")
+        raise HTTPException(status_code=500, detail=f"Таймаут удаленной команды: {e.cmd}")
 
-    stdin, stdout, stderr = ssh_client.exec_command(command)
-
-    output = stdout.read().decode()
-    error_output = stderr.read().decode()
-
-    if output:
-        logger.info(f"STDOUT от 'docker ps':\n{output}")
-    if error_output:
-        logger.warning(f"STDERR от 'docker ps':\n{error_output}")
-
-    if stdout.channel.recv_exit_status() != 0:
-        logger.error(f"Команда 'docker ps' завершилась с ошибкой. Вывод: {error_output}")
-        return f"Ошибка при получении статуса Docker: {error_output}"
-
-    if len(output.strip().splitlines()) > 1:
-        return output
-    else:
-        return "Нет запущенных контейнеров Docker, связанных с этим репозиторием."
-
-def get_commits_from_git_repo(repo_url: str, branch: str = "main", ssh_key_path: Optional[str] = None) -> List[CommitInfo]:
+def get_commits_from_git_repo(repo_url: str, branch: str = "main") -> List[CommitInfo]:
     """
-    Клонирует репозиторий в временную директорию и получает последние 10 коммитов
-    с помощью git log.
+    Клонирует или обновляет репозиторий локально и получает последние 10 коммитов.
     """
     found_commits = []
-    temp_dir = None
-    try:
-        logger.info(f"Получение коммитов из репозитория {repo_url} (ветка: {branch}) через git clone.")
-        temp_dir = tempfile.mkdtemp()
+    repo_name = repo_url.split('/')[-1].replace('.git', '')
+    local_path = os.path.join(LOCAL_REPOS_PATH, repo_name)
 
-        ssh_port_match = re.search(r':(\d+)/', repo_url)
-        port_option = f"-p {ssh_port_match.group(1)}" if ssh_port_match else ""
+    if not os.path.exists(LOCAL_REPOS_PATH):
+        os.makedirs(LOCAL_REPOS_PATH)
+        logger.info(f"Создана локальная папка для репозиториев: {LOCAL_REPOS_PATH}")
 
-        git_ssh_command_str = f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no {port_option}" if ssh_key_path else None
+    if not os.path.exists(local_path):
+        _run_local_shell_command(f"git clone --branch {branch} {repo_url} {local_path}")
+    else:
+        _run_local_shell_command(f"git checkout {branch}", cwd=local_path)
+        _run_local_shell_command("git pull", cwd=local_path)
+    
+    log_command = f"git log --pretty=format:%H|%an|%s --max-count=10"
+    commits_output, _ = _run_local_shell_command(log_command, cwd=local_path)
 
-        env = os.environ.copy()
-        if git_ssh_command_str:
-            env["GIT_SSH_COMMAND"] = git_ssh_command_str
-
-        clone_command = ["git", "clone", "--depth", "10", "--branch", branch, repo_url, temp_dir]
-
-        result = subprocess.run(clone_command, capture_output=True, text=True, check=True, env=env)
-        logger.info(f"Репозиторий {repo_url} успешно клонирован в {temp_dir}.")
-
-        log_command = ["git", "log", "--pretty=format:%H|%s", "-10"]
-        log_result = subprocess.run(log_command, cwd=temp_dir, capture_output=True, text=True, check=True)
-
-        commits_output = log_result.stdout.strip().split('\n')
-
-        for line in commits_output:
-            if line:
-                try:
-                    commit_hash, commit_message = line.split('|', 1)
-                    found_commits.append(CommitInfo(hash=commit_hash.strip(), message=commit_message.strip()))
-                except ValueError:
-                    logger.warning(f"Не удалось распарсить строку коммита: {line}")
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Ошибка выполнения git-команды: {e.stderr}")
-        found_commits.append(CommitInfo(hash="error", message=f"Ошибка Git: {e.stderr.strip()}"))
-    except Exception as e:
-        logger.error(f"Неизвестная ошибка при получении коммитов: {e}")
-        found_commits.append(CommitInfo(hash="error", message=f"Неизвестная ошибка: {e}"))
-    finally:
-        if temp_dir:
-            shutil.rmtree(temp_dir)
-            logger.info(f"Временная директория {temp_dir} удалена.")
+    for line in commits_output.splitlines():
+        if line:
+            try:
+                commit_hash, author, commit_message = line.split('|', 2)
+                found_commits.append(CommitInfo(hash=commit_hash.strip(), message=f"({author.strip()}) {commit_message.strip()}"))
+            except ValueError:
+                logger.warning(f"Не удалось распарсить строку коммита: {line}")
 
     return found_commits
 
@@ -219,163 +181,77 @@ async def get_repositories():
     logger.info(f"Найдено {len(repositories_from_config)} репозиториев в конфигурации для обработки.")
 
     for repo_config in repositories_from_config:
-        repo_name = repo_config["name"]
-        git_url = repo_config["git_url"]
-        branch = repo_config.get("branch", "main")
-        repo_ssh_key = repo_config.get("repo_ssh_key")
-        docker_compose_file = repo_config.get("docker_compose_file")
-        current_deployed_commit = repo_config.get("current_deployed_commit")
-        previous_deployed_commit = repo_config.get("previous_deployed_commit")
+        try:
+            commits = get_commits_from_git_repo(repo_config["git_url"], repo_config.get("branch", "main"))
+            
+            repo_list.append({
+                "name": repo_config["name"],
+                "git_url": repo_config["git_url"],
+                "branch": repo_config.get("branch", "main"),
+                "server_info": repo_config["server"],
+                "docker_compose_file": repo_config.get("docker_compose_file", "docker-compose.yml"),
+                "commits": [commit.model_dump() for commit in commits],
+                "current_deployed_commit": repo_config.get("current_deployed_commit"),
+                "previous_deployed_commit": repo_config.get("previous_deployed_commit")
+            })
+        except HTTPException as e:
+            repo_list.append({
+                "name": repo_config["name"],
+                "error": e.detail,
+                "commits": []
+            })
+        except Exception as e:
+             repo_list.append({
+                "name": repo_config["name"],
+                "error": f"Неизвестная ошибка: {str(e)}",
+                "commits": []
+            })
 
-        commits = get_commits_from_git_repo(git_url, branch, repo_ssh_key)
-
-        repo_list.append({
-            "name": repo_name,
-            "git_url": git_url,
-            "branch": branch,
-            "server_info": {
-                "ip": repo_config["server"]["ip"],
-                "user": repo_config["server"]["user"],
-                "deploy_path": repo_config["server"]["deploy_path"]
-            },
-            "repo_ssh_key": repo_ssh_key,
-            "server_ssh_key": repo_config["server"]["ssh_key"],
-            "docker_compose_file": docker_compose_file,
-            "commits": [commit.model_dump() for commit in commits],
-            "current_deployed_commit": current_deployed_commit,
-            "previous_deployed_commit": previous_deployed_commit
-        })
     logger.info(f"Сформирован список из {len(repo_list)} репозиториев для фронтенда.")
     return repo_list
 
-@app.post("/repos")
-async def add_repo(repo_config: RepositoryConfig):
-    """Добавляет новый репозиторий в конфигурацию."""
-    global _config
-    if any(r["name"] == repo_config.name for r in _config.get("repositories", [])):
-        raise HTTPException(status_code=400, detail="Репозиторий с таким именем уже существует.")
-
-    # Автоматически назначаем пути к ключам
-    repo_data = repo_config.model_dump()
-    repo_data["repo_ssh_key"] = DEFAULT_REPO_SSH_KEY_PATH
-    repo_data["server"]["ssh_key"] = DEFAULT_SERVER_SSH_KEY_PATH
-    repo_data["docker_compose_file"] = repo_data.get("docker_compose_file", "docker-compose.yml")
-    repo_data["current_deployed_commit"] = repo_data.get("current_deployed_commit", "")
-    repo_data["previous_deployed_commit"] = repo_data.get("previous_deployed_commit", "")
-
-    _config["repositories"].append(repo_data)
-    save_config()
-    return {"status": "success", "message": f"Репозиторий '{repo_config.name}' успешно добавлен."}
-
-@app.put("/repos/{repo_name}")
-async def update_repo(repo_name: str, updated_repo_config: RepositoryConfig):
-    """Обновляет существующий репозиторий в конфигурации."""
-    global _config
-    repo_found = False
-    for i, repo in enumerate(_config.get("repositories", [])):
-        if repo["name"] == repo_name:
-            repo_found = True
-
-            repo_data = updated_repo_config.model_dump()
-
-            # Сохраняем ключи, если они были в исходном конфиге, иначе подставляем по умолчанию
-            repo_data["repo_ssh_key"] = repo.get("repo_ssh_key", DEFAULT_REPO_SSH_KEY_PATH)
-            repo_data["server"]["ssh_key"] = repo["server"].get("ssh_key", DEFAULT_SERVER_SSH_KEY_PATH)
-
-            _config["repositories"][i] = repo_data
-            break
-
-    if not repo_found:
-        raise HTTPException(status_code=404, detail="Репозиторий не найден.")
-
-    save_config()
-    return {"status": "success", "message": f"Репозиторий '{repo_name}' успешно обновлен."}
-
-@app.delete("/repos/{repo_name}")
-async def delete_repo(repo_name: str):
-    """Удаляет репозиторий из конфигурации."""
-    global _config
-    initial_count = len(_config.get("repositories", []))
-    _config["repositories"] = [r for r in _config["repositories"] if r["name"] != repo_name]
-
-    if len(_config["repositories"]) == initial_count:
-        raise HTTPException(status_code=404, detail="Репозиторий не найден.")
-
-    save_config()
-    return {"status": "success", "message": f"Репозиторий '{repo_name}' успешно удален."}
-
-def _perform_deploy_action(repo: Dict, commit_hash: str, action_name: str, output_log: List[str]):
+def _perform_deploy_action(repo: Dict, commit_hash: str, action_name: str):
     """
     Вспомогательная функция для выполнения команд деплоя.
     """
+    repo_name = repo["name"]
     server_ip = repo["server"]["ip"]
     server_user = repo["server"]["user"]
     ssh_key_path = repo["server"]["ssh_key"]
     deploy_path = repo["server"]["deploy_path"]
-    git_url = repo["git_url"]
-    repo_ssh_key = repo["repo_ssh_key"]
-
-    ssh = None
-    sftp = None
-    remote_repo_key_path = None
-
+    docker_compose_file = repo.get("docker_compose_file", "docker-compose.yml")
+    local_path = os.path.join(LOCAL_REPOS_PATH, repo_name)
+    
+    if not os.path.exists(local_path):
+        raise HTTPException(status_code=400, detail="Локальный репозиторий не найден. Обновите список репозиториев.")
+    
     try:
-        logger.info(f"[{action_name}] Подключение к {server_user}@{server_ip} с ключом {ssh_key_path}...")
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=server_ip,
-            username=server_user,
-            key_filename=ssh_key_path,
-            timeout=30
+        # 1. Локальная синхронизация и переключение на коммит
+        logger.info(f"[{action_name}] Переключение на коммит {commit_hash} в локальном репозитории {repo_name}...")
+        _run_local_shell_command(f"git checkout {commit_hash}", cwd=local_path)
+        
+        # 2. Копирование файлов на целевой сервер
+        logger.info(f"[{action_name}] Копирование файлов на {server_user}@{server_ip}:{deploy_path}...")
+        rsync_command = (
+            f"rsync -avz --delete --exclude='.git/' -e 'ssh -i {ssh_key_path} -o StrictHostKeyChecking=no' "
+            f"{local_path}/ {server_user}@{server_ip}:{deploy_path}/"
         )
-        output_log.append(f"[{action_name}] Успешно подключено к {server_ip}")
-        logger.info(f"[{action_name}] Подключение к {server_ip} установлено.")
-
-        if repo_ssh_key:
-            sftp = paramiko.SFTPClient.from_transport(ssh.get_transport())
-            key_filename = os.path.basename(repo_ssh_key)
-            remote_repo_key_path = f"/tmp/{key_filename}"
-            sftp.put(repo_ssh_key, remote_repo_key_path)
-            _execute_remote_command(ssh, f"chmod 600 {remote_repo_key_path}", "Ошибка установки прав на SSH-ключ", output_log)
-            logger.info(f"[{action_name}] Ключ репозитория успешно скопирован в {remote_repo_key_path} на удаленном сервере.")
-
-        ssh_port_match = re.search(r':(\d+)/', git_url)
-        port_option = f"-p {ssh_port_match.group(1)}" if ssh_port_match else ""
-
-        git_ssh_command_str = f"export GIT_SSH_COMMAND=\"ssh -i {remote_repo_key_path} -o StrictHostKeyChecking=no {port_option}\"" if remote_repo_key_path else ""
-
-        _execute_remote_command(ssh, f"mkdir -p {deploy_path}", "Ошибка при создании директории", output_log, prepend_commands=git_ssh_command_str)
-        output_log.append(f"[{action_name}] Директория {deploy_path} проверена/создана.")
-
-        repo_status_cmd = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
-        repo_status_out, _ = _execute_remote_command(ssh, repo_status_cmd, "Ошибка проверки статуса репозитория", output_log, prepend_commands=git_ssh_command_str)
-        repo_status = repo_status_out.strip()
-        logger.info(f"[{action_name}] Статус репозитория в {deploy_path} на {server_ip}: {repo_status}")
-
-        if repo_status == "not_exists":
-            _execute_remote_command(ssh, f"cd {deploy_path} && git clone {git_url} .", "Ошибка клонирования", output_log, prepend_commands=git_ssh_command_str)
-            output_log.append(f"[{action_name}] Клонирование репозитория {git_url} завершено.")
-        else:
-            _execute_remote_command(ssh, f"cd {deploy_path} && git fetch --all --prune", "Ошибка обновления репозитория", output_log, prepend_commands=git_ssh_command_str)
-            output_log.append(f"[{action_name}] Обновление репозитория завершено.")
-
-        _execute_remote_command(ssh, f"cd {deploy_path} && git checkout -f {commit_hash}", "Ошибка переключения на коммит", output_log, prepend_commands=git_ssh_command_str)
-        output_log.append(f"[{action_name}] Переключение на коммит {commit_hash} завершено.")
-
-        # Обновленные команды docker-compose
-        docker_commands = [
-            f"cd {deploy_path}",
-            f"docker-compose down --rmi all --volumes && docker-compose up -d --build"
-        ]
-        _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose", output_log)
-        output_log.append(f"[{action_name}] Docker Compose действия (down, build, up -d) завершены.")
-
-        logger.info(f"[{action_name}] {action_name} '{repo['name']}' на коммит '{commit_hash}' успешно завершен.")
+        _run_local_shell_command(rsync_command)
+        logger.info("Копирование успешно завершено.")
+        
+        # 3. Выполнение команды docker-compose на целевом сервере
+        ssh_command = (
+            f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no {server_user}@{server_ip} "
+            f"'cd {deploy_path} && docker-compose -f {docker_compose_file} down --rmi all --volumes && docker-compose -f {docker_compose_file} up -d --build'"
+        )
+        
+        logger.info(f"[{action_name}] Запуск docker-compose на {server_ip}...")
+        _run_remote_shell_command(ssh_command)
+        logger.info(f"[{action_name}] Docker Compose действия завершены.")
 
         # Обновляем коммиты в конфиге
         for r in _config.get("repositories", []):
-            if r["name"] == repo["name"]:
+            if r["name"] == repo_name:
                 if action_name == "Откат":
                     current = r.get("current_deployed_commit")
                     previous = r.get("previous_deployed_commit")
@@ -386,28 +262,12 @@ def _perform_deploy_action(repo: Dict, commit_hash: str, action_name: str, outpu
                     r["current_deployed_commit"] = commit_hash
                 break
         save_config()
-
-    except paramiko.AuthenticationException as e:
-        logger.error(f"[{action_name}] Ошибка аутентификации при подключении к {server_ip}: {e}")
-        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: Проверьте SSH-ключ и права доступа. {e}")
-    except paramiko.SSHException as e:
-        logger.error(f"[{action_name}] Ошибка SSH при подключении/выполнении команд на {server_ip}: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка SSH: Не удалось подключиться или выполнить команды. {e}")
+        
+    except HTTPException as e:
+        raise e
     except Exception as e:
-        logger.error(f"[{action_name}] Неизвестная ошибка {action_name} для '{repo['name']}': {e}")
+        logger.error(f"[{action_name}] Неизвестная ошибка: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка {action_name}: {e}")
-    finally:
-        if ssh:
-            if sftp and remote_repo_key_path:
-                try:
-                    sftp.remove(remote_repo_key_path)
-                    logger.info(f"[{action_name}] Временный ключ {remote_repo_key_path} успешно удален с сервера.")
-                except Exception as e:
-                    logger.warning(f"[{action_name}] Не удалось удалить временный ключ с сервера: {e}")
-                finally:
-                    sftp.close()
-            ssh.close()
-            logger.info(f"[{action_name}] SSH-соединение с {server_ip} закрыто.")
 
 @app.post("/deploy/{repo_name}")
 async def deploy_repo(repo_name: str, request: DeployRequest):
@@ -419,13 +279,11 @@ async def deploy_repo(repo_name: str, request: DeployRequest):
     if not repo:
         raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
 
-    # Check if the requested commit is the same as the current one.
     if repo.get("current_deployed_commit") == request.commit_hash:
         raise HTTPException(status_code=400, detail="Эта версия уже развернута. Если вы хотите перезапустить, используйте кнопку 'Запустить'.")
 
-    output_log = []
-    _perform_deploy_action(repo, request.commit_hash, "Деплой", output_log)
-    return {"status": "success", "output": "\n".join(output_log)}
+    _perform_deploy_action(repo, request.commit_hash, "Деплой")
+    return {"status": "success", "output": f"Деплой на коммит {request.commit_hash} успешно завершен."}
 
 @app.post("/rollback/{repo_name}")
 async def rollback_repo(repo_name: str):
@@ -441,9 +299,8 @@ async def rollback_repo(repo_name: str):
     if not commit_hash_to_rollback:
         raise HTTPException(status_code=400, detail="Нет предыдущей версии для отката.")
 
-    output_log = []
-    _perform_deploy_action(repo, commit_hash_to_rollback, "Откат", output_log)
-    return {"status": "success", "output": "\n".join(output_log)}
+    _perform_deploy_action(repo, commit_hash_to_rollback, "Откат")
+    return {"status": "success", "output": f"Откат на коммит {commit_hash_to_rollback} успешно завершен."}
 
 @app.get("/status/{repo_name}")
 async def get_repo_status(repo_name: str):
@@ -453,50 +310,23 @@ async def get_repo_status(repo_name: str):
     logger.info(f"Получен запрос на получение статуса для '{repo_name}'.")
     repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
     if not repo:
-        logger.error(f"Репозиторий '{repo_name}' не найден в конфигурации.")
         raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
 
     server_ip = repo["server"]["ip"]
     server_user = repo["server"]["user"]
     ssh_key_path = repo["server"]["ssh_key"]
     deploy_path = repo["server"]["deploy_path"]
-
-    ssh = None
+    
+    ssh_command = (
+        f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no {server_user}@{server_ip} "
+        f"'cd {deploy_path} && docker-compose ps --format \"table {{.Image}}\t{{.Status}}\t{{.Ports}}\"'"
+    )
+    
     try:
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=server_ip,
-            username=server_user,
-            key_filename=ssh_key_path,
-            timeout=30
-        )
-        logger.info(f"Подключение к {server_ip} установлено.")
-
-        repo_status_cmd = f'[ -d {deploy_path}/.git ] && echo "exists" || echo "not_exists"'
-        stdin, stdout, stderr = ssh.exec_command(repo_status_cmd)
-        repo_exists = stdout.read().decode().strip() == "exists"
-
-        if not repo_exists:
-            return {"status": "not_deployed", "output": "Сервис еще не установлен на сервере."}
-
-        raw_docker_output = _get_docker_ps_raw(ssh, repo_name)
-
-        return {"status": "deployed", "output": raw_docker_output}
-
-    except paramiko.AuthenticationException as e:
-        logger.error(f"Ошибка аутентификации при получении статуса с {server_ip}: {e}")
-        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: {e}")
-    except paramiko.SSHException as e:
-        logger.error(f"Ошибка SSH при получении статуса с {server_ip}: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка SSH: {e}")
-    except Exception as e:
-        logger.error(f"Неизвестная ошибка при получении статуса для '{repo_name}': {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка: {e}")
-    finally:
-        if ssh:
-            ssh.close()
-            logger.info(f"SSH-соединение с {server_ip} закрыто.")
+        output, _ = _run_remote_shell_command(ssh_command)
+        return {"status": "deployed", "output": output}
+    except HTTPException as e:
+        return {"status": "error", "output": e.detail}
 
 @app.post("/run/{repo_name}")
 async def run_microservice(repo_name: str):
@@ -506,7 +336,6 @@ async def run_microservice(repo_name: str):
     logger.info(f"Получен запрос на запуск '{repo_name}'.")
     repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
     if not repo:
-        logger.error(f"Репозиторий '{repo_name}' не найден в конфигурации.")
         raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
 
     server_ip = repo["server"]["ip"]
@@ -515,53 +344,16 @@ async def run_microservice(repo_name: str):
     deploy_path = repo["server"]["deploy_path"]
     docker_compose_file = repo.get("docker_compose_file", "docker-compose.yml")
 
-    if not all([server_ip, server_user, ssh_key_path, deploy_path]):
-        logger.error(f"Недостающие данные конфигурации для запуска репозитория '{repo_name}'.")
-        raise HTTPException(status_code=500, detail="Недостающие данные конфигурации для сервера")
+    ssh_command = (
+        f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no {server_user}@{server_ip} "
+        f"'cd {deploy_path} && docker-compose -f {docker_compose_file} up -d'"
+    )
 
-    ssh = None
-    output_log = []
     try:
-        logger.info(f"Подключение к {server_user}@{server_ip} для запуска сервиса...")
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=server_ip,
-            username=server_user,
-            key_filename=ssh_key_path,
-            timeout=30
-        )
-        output_log.append(f"Успешно подключено к {server_ip}")
-        logger.info(f"Подключение к {server_ip} установлено.")
-
-        cmd_check_repo_exists = f'[ -d {deploy_path}/.git ]'
-        _, err = _execute_remote_command(ssh, cmd_check_repo_exists, "Ошибка проверки наличия репозитория", output_log)
-        if err:
-             raise HTTPException(status_code=400, detail="Репозиторий не найден на сервере. Сначала выполните 'Установить версию'.")
-
-        docker_commands = [
-            f"cd {deploy_path}",
-            f"docker-compose up -d"
-        ]
-        _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose при запуске", output_log)
-        output_log.append("Docker Compose up -d завершен.")
-
-        logger.info(f"Микросервис '{repo_name}' успешно запущен/перезапущен.")
-        return {"status": "success", "output": "\n".join(output_log)}
-
-    except paramiko.AuthenticationException as e:
-        logger.error(f"Ошибка аутентификации при запуске {server_ip}: {e}")
-        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации: Проверьте SSH-ключ и права доступа. {e}")
-    except paramiko.SSHException as e:
-        logger.error(f"Ошибка SSH при запуске/выполнении команд на {server_ip}: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка SSH: Не удалось подключиться или выполнить команды. {e}")
-    except Exception as e:
-        logger.error(f"Неизвестная ошибка при запуске для '{repo_name}': {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка запуска: {e}")
-    finally:
-        if ssh:
-            ssh.close()
-            logger.info(f"SSH-соединение с {server_ip} закрыто.")
+        output, _ = _run_remote_shell_command(ssh_command)
+        return {"status": "success", "output": f"Запуск успешно запрошен.\n{output}"}
+    except HTTPException as e:
+        raise e
 
 @app.post("/stop/{repo_name}")
 async def stop_microservice(repo_name: str):
@@ -571,7 +363,6 @@ async def stop_microservice(repo_name: str):
     logger.info(f"Получен запрос на остановку '{repo_name}'.")
     repo = next((r for r in _config.get("repositories", []) if r["name"] == repo_name), None)
     if not repo:
-        logger.error(f"Репозиторий '{repo_name}' не найден в конфигурации.")
         raise HTTPException(status_code=404, detail="Репозиторий не найден в конфигурации")
 
     server_ip = repo["server"]["ip"]
@@ -580,50 +371,50 @@ async def stop_microservice(repo_name: str):
     deploy_path = repo["server"]["deploy_path"]
     docker_compose_file = repo.get("docker_compose_file", "docker-compose.yml")
 
-    if not all([server_ip, server_user, ssh_key_path, deploy_path]):
-        logger.error(f"Недостающие данные конфигурации для остановки репозитория '{repo_name}'.")
-        raise HTTPException(status_code=500, detail="Недостающие данные конфигурации для сервера")
+    ssh_command = (
+        f"ssh -i {ssh_key_path} -o StrictHostKeyChecking=no {server_user}@{server_ip} "
+        f"'cd {deploy_path} && docker-compose -f {docker_compose_file} down'"
+    )
 
-    ssh = None
-    output_log = []
     try:
-        logger.info(f"Подключение к {server_user}@{server_ip} для остановки сервиса...")
-        ssh = paramiko.SSHClient()
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        ssh.connect(
-            hostname=server_ip,
-            username=server_user,
-            key_filename=ssh_key_path,
-            timeout=30
-        )
-        output_log.append(f"Успешно подключено к {server_ip}")
-        logger.info(f"Подключение к {server_ip} установлено.")
+        output, _ = _run_remote_shell_command(ssh_command)
+        return {"status": "success", "output": f"Остановка успешно запрошена.\n{output}"}
+    except HTTPException as e:
+        raise e
 
-        cmd_check_repo_exists = f'[ -d {deploy_path}/.git ]'
-        _, err = _execute_remote_command(ssh, cmd_check_repo_exists, "Ошибка проверки наличия репозитория", output_log)
-        if err:
-            raise HTTPException(status_code=400, detail="Репозиторий не найден на сервере. Невозможно остановить сервис.")
+@app.post("/repos", status_code=201, response_model=Dict)
+async def add_repo(repo: RepositoryConfig):
+    """Добавляет новый репозиторий в конфигурацию."""
+    if any(r["name"] == repo.name for r in _config.get("repositories", [])):
+        raise HTTPException(status_code=409, detail="Репозиторий с таким именем уже существует.")
+    
+    _config["repositories"].append(repo.dict())
+    save_config()
+    return {"message": "Репозиторий успешно добавлен."}
 
-        docker_commands = [
-            f"cd {deploy_path}",
-            f"docker-compose down"
-        ]
-        _execute_remote_command(ssh, " && ".join(docker_commands), "Ошибка Docker Compose при остановке", output_log)
-        output_log.append("Docker Compose down завершен.")
+@app.put("/repos/{repo_name}", response_model=Dict)
+async def update_repo(repo_name: str, repo: RepositoryConfig):
+    for i, r in enumerate(_config.get("repositories", [])):
+        if r["name"] == repo_name:
+            _config["repositories"][i] = repo.dict()
+            save_config()
+            return {"message": "Репозиторий успешно обновлен."}
+    
+    raise HTTPException(status_code=404, detail="Репозиторий не найден.")
 
-        logger.info(f"Микросервис '{repo_name}' успешно остановлен.")
-        return {"status": "success", "output": "\n".join(output_log)}
-
-    except paramiko.AuthenticationException as e:
-        logger.error(f"Ошибка аутентификации при остановке {server_ip}: {e}")
-        raise HTTPException(status_code=401, detail=f"Ошибка аутентификации при остановке: {e}")
-    except paramiko.SSHException as e:
-        logger.error(f"Ошибка SSH при остановке/выполнении команд на {server_ip}: {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка SSH при остановке: {e}")
-    except Exception as e:
-        logger.error(f"Неизвестная ошибка при остановке для '{repo_name}': {e}")
-        raise HTTPException(status_code=500, detail=f"Ошибка остановки: {e}")
-    finally:
-        if ssh:
-            ssh.close()
-            logger.info(f"SSH-соединение с {server_ip} закрыто.")
+@app.delete("/repos/{repo_name}", response_model=Dict)
+async def delete_repo(repo_name: str):
+    initial_count = len(_config.get("repositories", []))
+    _config["repositories"] = [r for r in _config.get("repositories", []) if r["name"] != repo_name]
+    
+    if len(_config["repositories"]) == initial_count:
+        raise HTTPException(status_code=404, detail="Репозиторий не найден.")
+    
+    save_config()
+    # Удаляем локальный репозиторий, если он существует
+    local_path = os.path.join(LOCAL_REPOS_PATH, repo_name)
+    if os.path.exists(local_path):
+        shutil.rmtree(local_path)
+        logger.info(f"Локальный кэш репозитория {repo_name} удален.")
+    
+    return {"message": "Репозиторий успешно удален."}
