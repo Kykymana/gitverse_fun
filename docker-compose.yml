@@ -9,20 +9,13 @@ services:
       - ./config.json:/app/config.json
     environment:
       - CONFIG_PATH=/app/config.json
-    networks:
-      - app_network
     restart: unless-stopped
-
+  
   frontend:
     build: ./frontend
     ports:
       - "8888:80"
     depends_on:
       - backend
-    networks:
-      - app_network
+    network_mode: "service:backend"
     restart: unless-stopped
-
-networks:
-  app_network:
-    driver: bridge
