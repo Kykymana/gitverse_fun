@@ -15,42 +15,15 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-app = FastAPI()
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# Глобальные переменные и константы
 _config: Dict = {}
 CONFIG_PATH = os.environ.get("CONFIG_PATH", "config.json")
 LOCAL_REPOS_PATH = os.path.join(os.getcwd(), "local_repos")
 CMD_TIMEOUT = 180
 
-class CommitInfo(BaseModel):
-    hash: str
-    message: str
-
-class DeployRequest(BaseModel):
-    commit_hash: str
-
-class ServerConfig(BaseModel):
-    ip: str
-    user: str
-    deploy_path: str
-    ssh_key: Optional[str] = None
-
-class RepositoryConfig(BaseModel):
-    name: str
-    git_url: str
-    branch: str = "main"
-    server: ServerConfig
-    docker_compose_file: str = "docker-compose.yml"
-    current_deployed_commit: Optional[str] = None
-    previous_deployed_commit: Optional[str] = None
+# -------------------------------------------------------------------
+# ИСПРАВЛЕННЫЙ БЛОК ИНИЦИАЛИЗАЦИИ ПРИЛОЖЕНИЯ
+# -------------------------------------------------------------------
 
 def save_config():
     """Сохранение текущей конфигурации в JSON файл."""
@@ -84,13 +57,52 @@ def load_config_on_startup():
         logger.error(f"Неизвестная ошибка при загрузке {CONFIG_PATH}: {e}")
         _config = {"repositories": []}
 
+# Сначала определяем функцию lifespan
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     load_config_on_startup()
     yield
 
+# Затем создаем ЕДИНСТВЕННЫЙ экземпляр FastAPI, передавая ему lifespan
 app = FastAPI(lifespan=lifespan)
 
+# И уже к этому экземпляру применяем CORS Middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # В production лучше указать конкретный домен фронтенда
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# -------------------------------------------------------------------
+# КОНЕЦ ИСПРАВЛЕННОГО БЛОКА. ДАЛЕЕ КОД БЕЗ ИЗМЕНЕНИЙ.
+# -------------------------------------------------------------------
+
+# Pydantic модели
+class CommitInfo(BaseModel):
+    hash: str
+    message: str
+
+class DeployRequest(BaseModel):
+    commit_hash: str
+
+class ServerConfig(BaseModel):
+    ip: str
+    user: str
+    deploy_path: str
+    ssh_key: Optional[str] = None
+
+class RepositoryConfig(BaseModel):
+    name: str
+    git_url: str
+    branch: str = "main"
+    server: ServerConfig
+    docker_compose_file: str = "docker-compose.yml"
+    current_deployed_commit: Optional[str] = None
+    previous_deployed_commit: Optional[str] = None
+
+# Вспомогательные функции
 def _run_local_shell_command(command: str, cwd: Optional[str] = None) -> Tuple[str, str]:
     """
     Выполняет локальную команду shell и возвращает (stdout, stderr).
@@ -171,45 +183,6 @@ def get_commits_from_git_repo(repo_url: str, branch: str = "main") -> List[Commi
 
     return found_commits
 
-@app.get("/repos", response_model=List[Dict])
-async def get_repositories():
-    """
-    Возвращает список доступных репозиториев с их последними 10 коммитами.
-    """
-    repo_list = []
-    repositories_from_config = _config.get("repositories", [])
-    logger.info(f"Найдено {len(repositories_from_config)} репозиториев в конфигурации для обработки.")
-
-    for repo_config in repositories_from_config:
-        try:
-            commits = get_commits_from_git_repo(repo_config["git_url"], repo_config.get("branch", "main"))
-            
-            repo_list.append({
-                "name": repo_config["name"],
-                "git_url": repo_config["git_url"],
-                "branch": repo_config.get("branch", "main"),
-                "server_info": repo_config["server"],
-                "docker_compose_file": repo_config.get("docker_compose_file", "docker-compose.yml"),
-                "commits": [commit.model_dump() for commit in commits],
-                "current_deployed_commit": repo_config.get("current_deployed_commit"),
-                "previous_deployed_commit": repo_config.get("previous_deployed_commit")
-            })
-        except HTTPException as e:
-            repo_list.append({
-                "name": repo_config["name"],
-                "error": e.detail,
-                "commits": []
-            })
-        except Exception as e:
-             repo_list.append({
-                "name": repo_config["name"],
-                "error": f"Неизвестная ошибка: {str(e)}",
-                "commits": []
-            })
-
-    logger.info(f"Сформирован список из {len(repo_list)} репозиториев для фронтенда.")
-    return repo_list
-
 def _perform_deploy_action(repo: Dict, commit_hash: str, action_name: str):
     """
     Вспомогательная функция для выполнения команд деплоя.
@@ -268,6 +241,46 @@ def _perform_deploy_action(repo: Dict, commit_hash: str, action_name: str):
     except Exception as e:
         logger.error(f"[{action_name}] Неизвестная ошибка: {e}")
         raise HTTPException(status_code=500, detail=f"Ошибка {action_name}: {e}")
+
+# Эндпоинты API
+@app.get("/repos", response_model=List[Dict])
+async def get_repositories():
+    """
+    Возвращает список доступных репозиториев с их последними 10 коммитами.
+    """
+    repo_list = []
+    repositories_from_config = _config.get("repositories", [])
+    logger.info(f"Найдено {len(repositories_from_config)} репозиториев в конфигурации для обработки.")
+
+    for repo_config in repositories_from_config:
+        try:
+            commits = get_commits_from_git_repo(repo_config["git_url"], repo_config.get("branch", "main"))
+            
+            repo_list.append({
+                "name": repo_config["name"],
+                "git_url": repo_config["git_url"],
+                "branch": repo_config.get("branch", "main"),
+                "server_info": repo_config["server"],
+                "docker_compose_file": repo_config.get("docker_compose_file", "docker-compose.yml"),
+                "commits": [commit.model_dump() for commit in commits],
+                "current_deployed_commit": repo_config.get("current_deployed_commit"),
+                "previous_deployed_commit": repo_config.get("previous_deployed_commit")
+            })
+        except HTTPException as e:
+            repo_list.append({
+                "name": repo_config["name"],
+                "error": e.detail,
+                "commits": []
+            })
+        except Exception as e:
+             repo_list.append({
+                "name": repo_config["name"],
+                "error": f"Неизвестная ошибка: {str(e)}",
+                "commits": []
+            })
+
+    logger.info(f"Сформирован список из {len(repo_list)} репозиториев для фронтенда.")
+    return repo_list
 
 @app.post("/deploy/{repo_name}")
 async def deploy_repo(repo_name: str, request: DeployRequest):

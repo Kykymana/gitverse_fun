@@ -1,19 +1,5 @@
 {
     "repositories": [
-        {
-            "name": "test_Order_microservice",
-            "git_url": "ssh://git@gitverse.ru:2222/phodo/Order_microservice.git",
-            "branch": "master",
-            "server": {
-                "ip": "109.73.203.182",
-                "user": "root",
-                "deploy_path": "./Order_microservice",
-                "ssh_key": "./ssh_keys/server_key"
-            },
-            "repo_ssh_key": "./ssh_keys/repo_key",
-            "docker_compose_file": "docker-compose.yml",
-            "current_deployed_commit": null,
-            "previous_deployed_commit": null
-        }
+
     ]
 }
